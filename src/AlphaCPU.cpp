@@ -2251,6 +2251,11 @@ int CAlphaCPU::virt2phys(u64 virt, u64* phys, int flags, bool* asm_bit, u32 ins)
 				// Handle D-stream access violation
 				state.exc_addr = state.current_pc;
 				state.fault_va = virt;
+				/* HRM 5.1.5/D.24: VA_FORM is derived from VA, which is written
+				   on every D-stream fault (incl. DFAULT), not just TB miss.
+				   Keep the VA_FORM snapshot current so the OS fault handler
+				   computes the right PTE. */
+				state.va_form_va = virt;
 				state.exc_sum = ((u64)REG_1 & 0x1f) << 8;  /* HRM 5.2.13: EXC_SUM REG[12:8] is 5 bits */
 
 				u32 opcode = I_GETOP(ins);
@@ -2311,6 +2316,11 @@ int CAlphaCPU::virt2phys(u64 virt, u64* phys, int flags, bool* asm_bit, u32 ins)
 				// handle D-stream access fault
 				state.exc_addr = state.current_pc;
 				state.fault_va = virt;
+				/* HRM 5.1.5/D.24: VA_FORM is derived from VA, which is written
+				   on every D-stream fault (including FOR/FOW DFAULT), not just TB
+				   miss. Keep the VA_FORM snapshot current so the OS fault
+				   handler computes the right PTE address. */
+				state.va_form_va = virt;
 				state.exc_sum = ((u64)REG_1 & 0x1f) << 8;  /* HRM 5.2.13: EXC_SUM REG[12:8] is 5 bits */
 
 				/* HRM 5.3.8 MM_STAT: FOR [bit 2] is set when a fault-on-read
