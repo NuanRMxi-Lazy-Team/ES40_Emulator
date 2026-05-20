@@ -332,8 +332,13 @@
 // EXCB/MB: full fence (data+io ordering).
 #define DO_EXCB     std::atomic_thread_fence(std::memory_order_seq_cst);
 #define DO_MB       std::atomic_thread_fence(std::memory_order_seq_cst);
-// WMB: release barrier is sufficient for “write” ordering intent.
-#define DO_WMB      std::atomic_thread_fence(std::memory_order_release);
+// WMB: HRM §4.11.1 requires WMB to order all prior stores from this CPU
+// before all subsequent stores, as observed by every other CPU/DMA agent.
+// A standalone atomic_thread_fence(release) only synchronizes with a matching
+// acquire fence/load on another thread; it does NOT impose store-store
+// ordering visible to unsynchronized observers. Use seq_cst to match QEMU
+// (TCG_BAR_SC | TCG_MO_ST_ST) and guarantee observed ordering.
+#define DO_WMB      std::atomic_thread_fence(std::memory_order_seq_cst);
 // FETCH/FETCH_M/ECB/WH64/WH64EN are hints — safe as no-ops.
 #define DO_FETCH    ;    /* hint: no effect */
 #define DO_FETCH_M  ;    /* hint: no effect */

@@ -409,8 +409,13 @@ u64 CAlphaCPU::ieee_cvtfi(u64 op, u32 ins)
 	}
 	else if (ubexp <= UF_V_NM) /* in range? */
 	{
-		sticky = (a.frac << (64 - (UF_V_NM - ubexp))) & X64_QUAD;
-		a.frac = a.frac >> (UF_V_NM - ubexp); /* result */
+		/* When ubexp == UF_V_NM (63), the shift amount (UF_V_NM - ubexp) is
+		   zero and (64 - 0) is 64, which is undefined behavior for `<< 64`
+		   on a 64-bit value. The architectural meaning at the boundary is
+		   "no bits shifted out" — the value is exact in integer form. */
+		s32 sh = UF_V_NM - ubexp;
+		sticky = sh ? ((a.frac << (64 - sh)) & X64_QUAD) : 0;
+		a.frac = a.frac >> sh;                /* result */
 	}
 	else
 	{
@@ -508,7 +513,22 @@ u64 CAlphaCPU::ieee_fadd(u64 s1, u64 s2, u32 ins, u32 dp, bool sub)
 	if (ftpa == UFT_INF)
 		return s1;  /* A = inf? ret A */
 	if (ftpa == UFT_ZERO)
-		a = b;      /* s1 = 0? */
+	{
+		if (ftpb == UFT_ZERO && (a.sign != b.sign))
+		{
+			/* Both operands zero, opposite effective signs (e.g. +0 + -0,
+			   or +0 - +0). IEEE-754 6.3: sign is '+' except under
+			   roundTowardNegative where it is '-'. */
+			u32 rndm = I_GETFRND(ins);
+			if (rndm == I_FRND_D) rndm = FPCR_GETFRND(state.fpcr);
+			a.sign = (rndm == I_FRND_M) ? 1 : 0;
+			a.exp = 0; a.frac = 0;
+		}
+		else
+		{
+			a = b;  /* s1 = 0, result is b */
+		}
+	}
 	else if (ftpb != UFT_ZERO)
 	{ /* s2 != 0? */
 		if ((a.exp < b.exp)      /* s1 < s2? swap */
@@ -532,6 +552,14 @@ u64 CAlphaCPU::ieee_fadd(u64 s1, u64 s2, u32 ins, u32 dp, bool sub)
 		{ /* eff sub? */
 			a.frac = (a.frac - b.frac) & X64_QUAD;  /* subtract fractions */
 			ieee_norm(&a);
+			if (a.frac == 0)
+			{
+				/* Exact cancellation. IEEE-754 6.3: sign is '+' except
+				   under roundTowardNegative where it is '-'. */
+				u32 rndm = I_GETFRND(ins);
+				if (rndm == I_FRND_D) rndm = FPCR_GETFRND(state.fpcr);
+				a.sign = (rndm == I_FRND_M) ? 1 : 0;
+			}
 		} /* normalize */
 		else
 		{ /* eff add */
@@ -660,8 +688,9 @@ u64 CAlphaCPU::ieee_fdiv(u64 s1, u64 s2, u32 ins, u32 dp)
 
 	if (ftpa == UFT_INF)
 	{   /* A = inf? */
-		if (ftpb == UFT_ZERO)  /* inf/0? */
-			ieee_trap(TRAP_DZE, 1, FPCR_DZED, ins); /* div by 0 trap */
+		/* inf/0 returns +/-inf with NO exception per IEEE-754 7.3:
+		   DZE is signaled only when the dividend is finite non-zero.
+		   Previously raised DZE here, breaking inf-arithmetic in libm. */
 		return(a.sign ? FMINF : FPINF);
 	}   /* return inf */
 
@@ -930,8 +959,13 @@ void CAlphaCPU::ieee_trap(u64 trap, u32 instenb, u64 fpcrdsb, u32 ins)
 {
 	u64 real_trap = U64(0x0);
 
+	/* HRM 4.7.6: the FPCR sticky bit is set whenever the corresponding
+	   exception is detected, regardless of whether a trap is delivered. */
 	if (~state.fpcr & (trap << 51))  // trap bit not set in FPCR
+	{
+		state.fpcr |= trap << 51;     // set FPCR sticky bit (newly detected)
 		real_trap |= trap << 41;      // SET trap bit in EXC_SUM
+	}
 	if ((instenb != 0) /* not enabled in inst? ignore */
 		&& !((ins & I_FTRP_S) && (state.fpcr & fpcrdsb)))  /* /S and disabled? ignore */real_trap |= trap; // trap bit in EXC_SUM
 	if (real_trap)
