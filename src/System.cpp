@@ -792,6 +792,23 @@ void CSystem::cpu_break_lock(int cpuid, CSystemComponent* source)
 }
 
 /**
+ * Quietly clear one CPU's load-locked flag.
+ *
+ * Called when that CPU takes an exception or interrupt (or any other event
+ * that disturbs an in-progress LDx_L/STx_C sequence). Per HRM 4.2.4 / the
+ * Alpha AHB, a STx_C must fail if an exception/interrupt occurred since the
+ * matching LDx_L; clearing lock_flag here makes the subsequent STx_C fail as
+ * required. f nothing is locked on this CPU, skip the mutex.
+ **/
+void CSystem::cpu_clear_lock(int cpuid)
+{
+	if (!(state.cpu_lock_flags & (1 << cpuid)))
+		return;
+	SCOPED_FM_LOCK(cpu_lock_mutex);
+	state.cpu_lock_flags &= ~(1 << cpuid);
+}
+
+/**
  * \brief Write 8, 4, 2 or 1 byte(s) to a 64-bit system address. This could be memory,
  * internal chipset registers, nothing or some device.
  *

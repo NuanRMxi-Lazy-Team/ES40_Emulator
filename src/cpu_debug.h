@@ -170,6 +170,12 @@ void          handle_debug_string(char* s);
     handle_debug_string(dbg_string);                            \
     state.exc_addr = state.current_pc;                          \
     set_pc(state.pal_base | offset | 1);                        \
+    /* HRM 4.2.4: a taken exception/interrupt clears lock_flag so a pending  \
+       STx_C fails. Exclude transparent TB-miss fills, which real HW does    \
+       not use to clear the lock. */                            \
+    if((offset) != DTBM_SINGLE && (offset) != DTBM_DOUBLE_3 &&  \
+       (offset) != DTBM_DOUBLE_4 && (offset) != ITB_MISS)       \
+      cSystem->cpu_clear_lock(state.iProcNum);                  \
     if((offset == DTBM_SINGLE || offset == ITB_MISS) && bTrace) \
       trc->set_waitfor(this, state.exc_addr &~U64(0x3));        \
     else                                                        \
@@ -185,6 +191,12 @@ void          handle_debug_string(char* s);
   {                                      \
     state.exc_addr = state.current_pc;   \
     set_pc(state.pal_base | offset | 1); \
+    /* HRM 4.2.4: clear lock_flag on taken exception/interrupt (fail a       \
+       pending STx_C). Exclude transparent TB-miss fills; offset is a        \
+       compile-time constant so this condition folds to nothing per site. */ \
+    if((offset) != DTBM_SINGLE && (offset) != DTBM_DOUBLE_3 &&               \
+       (offset) != DTBM_DOUBLE_4 && (offset) != ITB_MISS)                    \
+      cSystem->cpu_clear_lock(state.iProcNum);                               \
   }
 #endif
 #if defined(IDB)

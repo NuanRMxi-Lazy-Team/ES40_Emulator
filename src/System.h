@@ -281,6 +281,7 @@ public:
   bool          cpu_unlock(int cpuid, u64 address, bool clear = true);
   void          cpu_break_locks(u64 address, CSystemComponent* source, bool include_source = false);
   void          cpu_break_lock(int cpuid, CSystemComponent* source);
+  void          cpu_clear_lock(int cpuid);
   void          RequestSystemReset();
   bool          IsSystemResetRequested() const;
   bool          ProcessPendingReset();   // Returns true if a reset was performed.

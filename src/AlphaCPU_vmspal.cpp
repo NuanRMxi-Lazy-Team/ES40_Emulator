@@ -924,6 +924,11 @@ int CAlphaCPU::vmspal_int_initiate_exception()
 {
 	u64 phys_address;
 
+	/* HRM 4.2.4: a taken exception clears lock_flag so a STx_C interrupted by
+	   it fails. Reached only for real exceptions (transparent TB fills return
+	   from vmspal_ent_dtbm_single without coming here). */
+	cSystem->cpu_clear_lock(state.iProcNum);
+
 	p4 = p22 & U64(0x18);
 	hw_ldq(p21 + U64(0x10), p20);
 	if (p4)
@@ -976,6 +981,10 @@ int CAlphaCPU::vmspal_int_initiate_exception()
 int CAlphaCPU::vmspal_int_initiate_interrupt()
 {
 	u64 phys_address;
+
+	/* HRM 4.2.4: a taken interrupt clears lock_flag so an in-progress
+	   LDx_L/STx_C sequence interrupted here correctly fails its STx_C. */
+	cSystem->cpu_clear_lock(state.iProcNum);
 
 	p4 = p22 & U64(0x18);
 	hw_ldq(p21 + U64(0x10), p20);
