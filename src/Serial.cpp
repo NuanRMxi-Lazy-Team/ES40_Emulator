@@ -293,7 +293,7 @@ void CSerial::init()
 		state.bMSR = 0x30;  // CTS, DSR
 		state.bSPR = 0x00;
 		state.serial_cycles = 0;
-		state.irq_active = false;
+		state.thre_pending = false;
 		iac_carry_len = 0;
 		in_subneg = false;
 		stageLen = 0;
@@ -370,7 +370,7 @@ void CSerial::init()
 	state.bMSR = 0x30;  // CTS, DSR
 	state.bSPR = 0x00;
 	state.serial_cycles = 0;
-	state.irq_active = false;
+	state.thre_pending = false;
 	iac_carry_len = 0;
 	in_subneg = false;
 	stageLen = 0;
@@ -454,6 +454,8 @@ u64 CSerial::ReadMem(int index, u64 address, int dsize)
 #endif
 			}
 
+			// Received-data interrupt follows the FIFO — it may have just emptied.
+			eval_interrupts();
 			return state.bRDR;
 		}
 
@@ -469,7 +471,9 @@ u64 CSerial::ReadMem(int index, u64 address, int dsize)
 
 	case 2: //interrupt cause
 		d = state.bIIR;
-		state.bIIR = 0x01;
+		if (d == 0x02)
+			state.thre_pending = false;  // reading IIR acknowledges THRE
+		eval_interrupts();               // recompute IIR and re-drive the IRQ line
 		return d;
 
 	case 3:
@@ -536,6 +540,9 @@ void CSerial::WriteMem(int index, u64 address, int dsize, u64 data)
 			printf("Write character %02x (%c) on serial port %d\n", d, printable(d),
 				state.iNumber);
 #endif
+			// TX is instantaneous: the holding register is empty again, so
+			// re-arm THRE (delivered only if the THRE interrupt is enabled).
+			state.thre_pending = true;
 			eval_interrupts();
 		}
 		break;
@@ -549,9 +556,12 @@ void CSerial::WriteMem(int index, u64 address, int dsize, u64 data)
 		}
 		else
 		{
-
-			// Interrupt Enable Register
+			// Interrupt Enable Register.  Enabling the THRE interrupt while the
+			// (instantly-drained) holding register is empty arms one THRE edge.
+			u8 prev_ier = state.bIER;
 			state.bIER = d;
+			if ((d & 0x02) && !(prev_ier & 0x02))
+				state.thre_pending = true;
 			eval_interrupts();
 		}
 		break;
@@ -603,23 +613,19 @@ void CSerial::eval_interrupts()
 {
 	if (disabled)
 		return;
+
+	// RX-available is a level (follows the receive FIFO); THR-empty is edge-
+	// latched in thre_pending (set on THR write / THRE enable, cleared on IIR
+	// read) because es40's instant TX would make a plain THRE level storm.
 	state.bIIR = 0x01;        // no interrupt
 	if ((state.bIER & 0x01) && (state.rcvR != state.rcvW))
-		state.bIIR = 0x04;
-	else if (state.bIER & 0x2) //transmitter buffer empty enabled?
-		state.bIIR = 0x02;      //transmitter buffer empty
-	else
-		state.bIIR = 0x01;      // no interrupt
-	if (state.bIIR > 0x01)
-	{
-		if (!state.irq_active)
-			theAli->pic_interrupt(0, 4 - state.iNumber);
-	}
-	else
-	{
-		if (state.irq_active)
-			theAli->pic_deassert(0, 4 - state.iNumber);
-	}
+		state.bIIR = 0x04;    // received data available
+	else if ((state.bIER & 0x02) && state.thre_pending)
+		state.bIIR = 0x02;    // transmitter holding register empty
+
+	// Drive IRQ4 (serial0) / IRQ3 (serial1) as a level following the cause;
+	// pic_set_line() makes one edge per rising transition, retracting on fall.
+	theAli->pic_set_line(0, 4 - state.iNumber, state.bIIR > 0x01);
 }
 
 void CSerial::write(const char* s, int dsize)

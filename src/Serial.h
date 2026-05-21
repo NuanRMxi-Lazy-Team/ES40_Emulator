@@ -162,7 +162,7 @@ private:
     int   rcvW;
     int   rcvR;
     int   iNumber;
-    bool  irq_active;
+    bool  thre_pending; /**< THRE interrupt latched (THR emptied, not yet acked by an IIR read) */
   } state;
   int listenPort;
   int64_t listenSocket;
