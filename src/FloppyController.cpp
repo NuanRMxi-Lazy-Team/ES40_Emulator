@@ -297,6 +297,24 @@ void CFloppyController::WriteMem(int index, u64 address, int dsize, u64 data)
 				{
 					int drive_idx = state.cmd_parms[1] & 0x03;
 					int head = (state.cmd_parms[1] >> 2) & 1;
+
+					// The FDC chip is always present via es40-cfg generated configs, 
+					// but a R/W data command issued to a drive with not present or 
+					// no disk needs to term abnormally instead of dereferencing a null
+					// ST0 IC=01 (abnormal termination) with the Not Ready bit set.
+					if (FDISK(drive_idx) == NULL) {
+						printf("FDC [CMD %02x]: drive %d not ready (no media) - aborting\n", cmd, drive_idx);
+						state.cmd_res[0] = 0x40 | ST0_NR | (head << 2) | drive_idx; // ST0
+						state.cmd_res[1] = 0;                   // ST1
+						state.cmd_res[2] = 0;                   // ST2
+						state.cmd_res[3] = state.cmd_parms[2];  // C (cylinder)
+						state.cmd_res[4] = state.cmd_parms[3];  // H (head)
+						state.cmd_res[5] = state.cmd_parms[4];  // R (sector)
+						state.cmd_res[6] = state.cmd_parms[5];  // N (sector size)
+						do_interrupt();
+						break;  // -> switch(cmd) tail arms the result phase (rqm=1, dio=1)
+					}
+
 					int cyl = state.cmd_parms[2];
 					int sector = state.cmd_parms[4];
 					int eot = state.cmd_parms[6];
