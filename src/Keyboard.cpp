@@ -429,6 +429,13 @@ u8 CKeyboard::read_60()
 		state.status.auxb = 0;
 		state.irq12_requested = 0;
 
+		// Drop the IRQ line for the byte just read (clearing the 8259 edge
+		// latch) BEFORE the controller-queue refill below.  That refill writes
+		// the output buffer directly, so without this the refilled byte can't
+		// raise a fresh edge (last_irr stuck high) and wedges, freezing input.
+		// kbd_service() re-raises after the refill.
+		kbd_update_irq();
+
 		if (state.kbd_controller_Qsize)
 		{
 			unsigned  i;
@@ -463,6 +470,10 @@ u8 CKeyboard::read_60()
 		state.status.auxb = 0;
 		state.irq1_requested = 0;
 		state.bat_in_progress = 0;
+
+		// Drop the IRQ line before the controller-queue refill below (see the
+		// mouse path above) so the refilled byte still produces a fresh edge.
+		kbd_update_irq();
 
 		if (state.kbd_controller_Qsize)
 		{
