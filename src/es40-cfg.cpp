@@ -644,10 +644,10 @@ int main(int argc, char* argv[])
 
 	NumberQuestion cpu_q;
 
-	cpu_q.setQuestion("How many CPU's do you want in the system (Currently, only one is supported)?");
-	cpu_q.setRange(1, 1);
+	cpu_q.setQuestion("How many CPU's do you want in the system?");
+	cpu_q.setRange(1, 4);
 	cpu_q.setDefault("1");
-	cpu_q.setExplanation("The normal value for the number of CPU's is 1. More CPU's are very experimental, and currently doesn't work.");
+	cpu_q.setExplanation("The normal value for the number of CPU's is 1. Up to four are supported on the Tsunami platform.");
 
 	cpu_q.ask();
 
