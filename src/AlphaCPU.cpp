@@ -758,6 +758,29 @@ void CAlphaCPU::execute()
 #endif
 
 #ifndef ES40_JIT
+	// Poll the wall-clock Cchip interval timer once per execute() batch
+	// (~512 instructions) rather than every 32; 
+	if (state.iProcNum == 0)
+	{
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= next_timer_fire)
+		{
+			cSystem->interrupt(-1, true);
+			const u64 period_ns = theAli ? theAli->get_interval_period_ns() : 0;
+			if (period_ns)
+			{
+				next_timer_fire += std::chrono::nanoseconds(period_ns);
+				// Cap catchup to 1 wall-second after a long stall.
+				if (now - next_timer_fire > std::chrono::seconds(1))
+					next_timer_fire = now;
+			}
+			else
+			{
+				next_timer_fire = now + std::chrono::seconds(1);
+			}
+		}
+	}
+
 	_next_instruction :
 	if (--_batch_budget <= 0)
 	{
@@ -892,30 +915,6 @@ void CAlphaCPU::execute()
 			if (state.cc_ena)
 				state.cc += _cc_accum;
 			_cc_accum = 0;
-
-			// Wall-clock-paced Cchip interval timer.  Fires at most once
-			// per 32-instruction batch so successive ticks are naturally
-			// spaced by guest IRQ-handle work — no edge coalescing.
-			if (state.iProcNum == 0)
-			{
-				const auto now = std::chrono::steady_clock::now();
-				if (now >= next_timer_fire)
-				{
-					cSystem->interrupt(-1, true);
-					const u64 period_ns = theAli ? theAli->get_interval_period_ns() : 0;
-					if (period_ns)
-					{
-						next_timer_fire += std::chrono::nanoseconds(period_ns);
-						// Cap catchup to 1 wall-second after a long stall.
-						if (now - next_timer_fire > std::chrono::seconds(1))
-							next_timer_fire = now;
-					}
-					else
-					{
-						next_timer_fire = now + std::chrono::seconds(1);
-					}
-				}
-			}
 
 			// There are one or more active delayed irq_h interrupts. Go through the 6
 			// irq_h timers, decrease them as needed, and set the interrupt if the timer
