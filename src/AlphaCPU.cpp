@@ -718,40 +718,77 @@ void CAlphaCPU::jit_run(int budget)
 		// Hot path: virtual+ASN lookup, no address translation.
 		CJitEngine::JitBlock* b = m_jit->lookup(start_virt, start_asn);
 
-		// Run the compiled safe prefix natively when available.
-		if (b && b->code && (int) b->prefix_len <= budget)
+		// Run the compiled safe prefix natively when available -- but not while an
+		// interrupt or delayed timer is pending. Compiled blocks don't run the
+		// per-instruction polls, so run the interpreter.
+		if (b && b->code && (int) b->prefix_len <= budget
+			&& !state.check_int && !state.check_timers)
 		{
 #ifdef JIT_VERIFY
-			// Interpret the prefix (authoritative) and compare the compiled result.
-			// Skip the compare if an interrupt/trap diverts us mid-prefix.
+			// Interpret the prefix (authoritative), recording each loaded value so the
+			// compiled pass can replay it instead of re-reading memory. Skip the compare
+			// if an interrupt/trap diverts us mid-prefix.
 			u64 snap[32];
 			memcpy(snap, state.r, sizeof(snap));
+			const u32* vw = (const u32*) ((const u8*) dram_ptr + b->phys);
+			u32 vn = 0;
 			u64 vpc = start_virt;
 			bool clean = true;
 			for (u32 k = 0; k < b->prefix_len; ++k)
 			{
+				// Compute the load's effective address from the live registers BEFORE
+				// executing it (Rb may be the load's own dest), to compare against the JIT.
+				const u32 ins = vw[k];
+				const u32 opc = ins >> 26;
+				const int lra = (ins >> 21) & 0x1F;
+				const bool isld = (opc == 0x28 || opc == 0x29) && lra != 31;
+				u64 eva = 0;
+				if (isld)
+				{
+					const int lrb = (ins >> 16) & 0x1F;
+					const int ldisp = (int) (int16_t) (ins & 0xFFFF);
+					eva = (lrb == 31 ? (u64) 0 : state.r[lrb]) + (u64) ldisp;
+				}
 				execute();
 				--budget;
 				vpc += 4;
 				if (state.pc != vpc) { clean = false; break; }
+				if (isld && vn < 64)
+				{
+					m_jit_vaddr[vn] = eva;
+					m_jit_vlog[vn] = state.r[lra];
+					vn++;
+				}
 			}
 			if (clean)
 			{
 				u64 jr[32];
 				memcpy(jr, snap, sizeof(jr));
-				b->code(jr);
-				m_jit->verify_compare(start_virt, state.r, jr);
+				m_jit_vreplay = true;
+				m_jit_vlog_i = 0;
+				const u32 done = b->code(this, jr);
+				m_jit_vreplay = false;
+				if (done == b->prefix_len)
+					m_jit->verify_compare(start_virt, state.r, jr);
 			}
-#else
-			b->code(&state.r[0]);
-			state.r[31] = 0;
-			state.pc = start_virt + 4 * (u64) b->prefix_len;
-			budget -= b->prefix_len;
-#ifdef JIT_STATS
-			m_jit->note_exec(b->prefix_len, 0);
-#endif
-#endif
 			continue;
+#else
+			const u32 done = b->code(this, &state.r[0]);
+			state.r[31] = 0;
+			state.pc = start_virt + 4 * (u64) done;
+			// Match the interpreter's per-instruction accounting for the compiled ops:
+			// cycle counter (RPCC) and instruction count. Skipping it stalls state.cc and
+			// breaks guest timing -- and the verify can't catch it (these are IPRs, not GPRs).
+			state.instruction_count += done;
+			cc_large += (u64) done * cc_per_instruction;
+			if (state.cc_ena)
+				state.cc += (u64) done * cc_per_instruction;
+			budget -= done;
+#ifdef JIT_STATS
+			m_jit->note_exec(done, 0);
+#endif
+			if (done > 0) continue;   // progress made; done==0 (faulting first insn) falls through
+#endif
 		}
 
 		// Miss path (cold): peek the I-stream for the physical address, ASM bit, and
@@ -784,9 +821,68 @@ void CAlphaCPU::jit_run(int budget)
 		{
 			CJitEngine::JitBlock* nb = m_jit->record(start_virt, start_phys, start_asn, start_asm, n);
 			if (!nb->compiled)
-				m_jit->compile_block(nb, (const uint8_t*) dram_ptr, dram_size);
+				m_jit->compile_block(nb, (const uint8_t*) dram_ptr, dram_size, (void*) &CAlphaCPU::jit_read);
 		}
 	}
+}
+
+// JIT load helper (static). Reads size_bits from virtual address va into *out,
+// mirroring DATA_PHYS_NT's normal-read fast path. Returns 0 on success, or 1 on a
+// translation fault / unaligned access - the caller bails to the interpreter
+int CAlphaCPU::jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
+{
+	const u64 amask = (u64) (size_bits / 8) - 1;
+	if (va & amask) return 1;                 // unaligned: let the interpreter handle it
+
+	u64 phys;
+	const u64 vp = va & ~U64(0x1FFF);
+	if (cpu->data_page_cache[0].valid
+	    && cpu->data_page_cache[0].virt_page == vp
+	    && cpu->data_page_cache[0].cm  == cpu->state.cm
+	    && cpu->data_page_cache[0].asn == cpu->state.asn0)
+	{
+		phys = cpu->data_page_cache[0].phys_base | (va & U64(0x1FFF));
+	}
+	else
+	{
+		// Side-effect-free TB fast path. NOT virt2phys - that walks the page table and
+		// vectors faults as a side effect, which (re-done by the interpreter after we
+		// bail) corrupts state. Bail on a TB miss or any access fault and let the 
+		// interpreter do the side-effect translation ~  it fills this cache so the next 
+		// compiled run hits. Mirrors virt2phys's read path.
+		const int i = cpu->FindTBEntry(va, ACCESS_READ);
+		if (i < 0) return 1;                                                  // TB miss
+		const auto& e = cpu->state.tb[TB_INDEX_DATA][i];
+		if (!e.access[0][cpu->state.cm]) return 1;                            // protection (ACV)
+		if (e.fault[0]) return 1;                                             // fault-on-read (FOR)
+		phys = e.phys | (va & e.keep_mask);
+		cpu->data_page_cache[0].virt_page = vp;
+		cpu->data_page_cache[0].phys_base = phys & ~U64(0x1FFF);
+		cpu->data_page_cache[0].cm  = cpu->state.cm;
+		cpu->data_page_cache[0].asn = cpu->state.asn0;
+		cpu->data_page_cache[0].valid = true;
+	}
+
+	// Verify replay: return the value the interpreter pass loaded here, rather than
+	// re-reading (another CPU may have written it)
+	if (cpu->m_jit_vreplay)
+	{
+		if (va != cpu->m_jit_vaddr[cpu->m_jit_vlog_i])
+		{
+			static int n = 0;
+			if (n++ < 50)
+				printf("[JIT] LOAD ADDR MISMATCH: compiled va=%016llx interp va=%016llx\n",
+				       (unsigned long long) va, (unsigned long long) cpu->m_jit_vaddr[cpu->m_jit_vlog_i]);
+		}
+		*out = cpu->m_jit_vlog[cpu->m_jit_vlog_i++];
+		return 0;
+	}
+
+	if (phys < cpu->dram_size)
+		*out = dram_read(cpu->dram_ptr, phys, size_bits);
+	else
+		*out = cpu->cSystem->ReadMem(phys, size_bits, cpu);
+	return 0;
 }
 #endif
 

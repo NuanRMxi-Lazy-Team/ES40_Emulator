@@ -482,6 +482,15 @@ private:
   CJitEngine* m_jit = nullptr;
   void jit_run(int budget);    // drives the ES40_JIT lane via the interpreter
   void jit_flush_blocks();     // invalidate all discovered JIT blocks
+  // Compiled-block memory helper: read size_bits from va into *out; returns 0 on
+  // success, 1 on fault/unaligned.
+  static int jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out);
+  // Verify support: the interpreter pass records each value it loads, and the
+  // compiled pass replays them instead of re-reading memory - false mismatch fix
+  bool m_jit_vreplay = false;  // compiled pass: replay recorded loads, don't re-read
+  u32  m_jit_vlog_i  = 0;      // replay cursor
+  u64  m_jit_vlog[64];         // values the interpreter pass loaded (<= prefix_len)
+  u64  m_jit_vaddr[64];        // diagnostic: load addresses the interpreter computed
 #endif
 
   /// The state structure contains all elements that need to be saved to the statefile

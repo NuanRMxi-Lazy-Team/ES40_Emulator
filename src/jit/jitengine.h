@@ -15,6 +15,8 @@
 #include <cstdint>
 #include "../config_debug.h"   // JIT_VERIFY
 
+class CAlphaCPU;   // compiled blocks call back into the CPU for memory accesses
+
 class CJitEngine
 {
 public:
@@ -26,8 +28,9 @@ public:
   // than tearing down the asmjit runtime on every flush (see flush()).
   static constexpr uint64_t kReclaimBytes = 32 * 1024 * 1024;
 
-  // Compiled safe-prefix entry point: applies the prefix's ALU ops to regs[0..31].
-  typedef void (*JitFn)(uint64_t* regs);
+  // Compiled block entry point. Runs the prefix on regs[0..31], calling back into
+  // cpu for memory accesses; returns the number of instructions fully completed
+  typedef uint32_t (*JitFn)(CAlphaCPU* cpu, uint64_t* regs);
 
   struct JitBlock
   {
@@ -56,7 +59,7 @@ public:
   }
 
   JitBlock* record(uint64_t virt_pc, uint64_t phys_pc, uint32_t asn, bool asm_global, uint32_t n_instr);
-  void compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size);
+  void compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper);
   void flush();
 
 #ifdef JIT_VERIFY

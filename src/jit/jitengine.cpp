@@ -15,7 +15,8 @@ enum SafeOp {
   OP_S4ADDQ, OP_S8ADDQ, OP_S4SUBQ, OP_S8SUBQ,
   OP_AND, OP_BIS, OP_XOR, OP_BIC, OP_ORNOT, OP_EQV,
   OP_CMPEQ, OP_CMPLT, OP_CMPLE, OP_CMPULT, OP_CMPULE,
-  OP_SLL, OP_SRL, OP_SRA, OP_MULQ
+  OP_SLL, OP_SRL, OP_SRA, OP_MULQ,
+  OP_LDQ, OP_LDL                 // memory-format loads: Ra = MEM[Rb + disp16]
 };
 
 // Safe = goto-free, register-only operate-format ops (no trap, memory, or branch).
@@ -50,6 +51,8 @@ SafeOp classify(uint32_t ins)
     case 0x13: // INTM
       if (func == 0x20) return OP_MULQ;
       break;
+    case 0x28: return OP_LDL;   // memory-format loads (Ra = MEM[Rb+disp16])
+    case 0x29: return OP_LDQ;
   }
   return OP_NONE;
 }
@@ -110,7 +113,7 @@ void CJitEngine::flush()
   }
 }
 
-void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size)
+void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper)
 {
   using namespace asmjit;
   b->compiled = true;
@@ -133,13 +136,20 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     plen++;
   if (plen == 0) return;
 
-  // Emit  void fn(uint64_t* regs).  regs arrives in RCX (Win64); move it to R8 so
-  // RCX/CL is free for variable shifts. RAX = op1/result, RCX = operand2.
+  // Emit  uint32_t fn(CAlphaCPU* cpu, uint64_t* regs)  (Win64: cpu=RCX, regs=RDX).
+  // Keep cpu in RSI and regs in RBX (callee-saved, so they survive helper calls);
+  // reserve a 40-byte frame (32 shadow + 8 load-out slot) that keeps RSP 16-aligned
+  // for calls. RAX = op1/result, RCX = operand2 (CL for variable shifts).
   CodeHolder code;
   if (code.init(((JitRuntime*) m_rt)->environment()) != Error::kOk) return;
   x86::Assembler a(&code);
-  a.mov(x86::r8, x86::rcx);
+  a.push(x86::rbx);
+  a.push(x86::rsi);
+  a.sub(x86::rsp, imm(40));
+  a.mov(x86::rsi, x86::rcx);   // cpu
+  a.mov(x86::rbx, x86::rdx);   // regs base
 
+  Label done = a.new_label();  // shared bail/return target
   for (uint32_t i = 0; i < plen; ++i) {
     uint32_t ins = words[i];
     SafeOp op = classify(ins);
@@ -149,7 +159,7 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     bool islit = ((ins >> 12) & 1) != 0;
     uint32_t lit = (ins >> 13) & 0xFF;
 
-    auto reg = [&](int r) { return x86::qword_ptr(x86::r8, r * 8); };
+    auto reg = [&](int r) { return x86::qword_ptr(x86::rbx, r * 8); };
     auto op1_rax = [&]() {
       if (ra == 31) a.xor_(x86::eax, x86::eax);
       else          a.mov(x86::rax, reg(ra));
@@ -159,6 +169,32 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       else if (rb == 31) a.xor_(x86::ecx, x86::ecx);
       else               a.mov(x86::rcx, reg(rb));
     };
+
+    // Memory-format loads: va = regs[Rb] + disp16; call the read helper; on a
+    // translation fault bail to `done` returning i (instructions 0..i-1 committed).
+    if (op == OP_LDQ || op == OP_LDL) {
+      if (ra == 31) continue;            // LDx R31 is a NOP (interpreter skips the read)
+      const int disp = (int) (int16_t) (ins & 0xFFFF);
+      const int size_bits = (op == OP_LDQ) ? 64 : 32;
+      if (rb == 31)  a.mov(x86::rdx, imm(disp));
+      else        {  a.mov(x86::rdx, reg(rb)); if (disp) a.add(x86::rdx, imm(disp)); }
+      a.mov(x86::rcx, x86::rsi);                          // cpu
+      a.mov(x86::r8d, imm(size_bits));                    // size in bits
+      a.lea(x86::r9, x86::qword_ptr(x86::rsp, 32));       // &out slot
+      a.mov(x86::rax, imm((uint64_t) read_helper));
+      a.call(x86::rax);                                   // jit_read(cpu, va, size, &out)
+      Label ok = a.new_label();
+      a.test(x86::eax, x86::eax);
+      a.jz(ok);
+      a.mov(x86::eax, imm(i));                            // fault: bail, i instrs done
+      a.jmp(done);
+      a.bind(ok);
+      if (op == OP_LDQ) a.mov(x86::rax, x86::qword_ptr(x86::rsp, 32));
+      else              a.movsxd(x86::rax, x86::dword_ptr(x86::rsp, 32));  // LDL sign-extends
+      a.mov(reg(ra), x86::rax);
+      continue;
+    }
+
     switch (op) {
       case OP_ADDQ:  op1_rax(); op2_rcx(); a.add(x86::rax, x86::rcx); break;
       case OP_SUBQ:  op1_rax(); op2_rcx(); a.sub(x86::rax, x86::rcx); break;
@@ -188,10 +224,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       case OP_ADDL: case OP_SUBL:  // 32-bit, result sign-extended to 64
       {
         if (ra == 31) a.xor_(x86::eax, x86::eax);
-        else          a.mov(x86::eax, x86::dword_ptr(x86::r8, ra * 8));
+        else          a.mov(x86::eax, x86::dword_ptr(x86::rbx, ra * 8));
         if (islit)         a.mov(x86::ecx, imm(lit));
         else if (rb == 31) a.xor_(x86::ecx, x86::ecx);
-        else               a.mov(x86::ecx, x86::dword_ptr(x86::r8, rb * 8));
+        else               a.mov(x86::ecx, x86::dword_ptr(x86::rbx, rb * 8));
         if (op == OP_ADDL) a.add(x86::eax, x86::ecx);
         else               a.sub(x86::eax, x86::ecx);
         a.movsxd(x86::rax, x86::eax);
@@ -202,6 +238,11 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
 
     if (rc != 31) a.mov(reg(rc), x86::rax);
   }
+  a.mov(x86::eax, imm(plen));   // no fault: all instructions completed
+  a.bind(done);
+  a.add(x86::rsp, imm(40));
+  a.pop(x86::rsi);
+  a.pop(x86::rbx);
   a.ret();
 
   const size_t csz = code.code_size();
