@@ -64,6 +64,11 @@ public:
   void verify_compare(uint64_t blk_virt, const uint64_t* interp, const uint64_t* jit);
 #endif
 
+#ifdef JIT_STATS
+  // Accumulate native vs interpreted instruction counts; prints coverage periodically.
+  void note_exec(uint32_t native_instr, uint32_t interp_instr);
+#endif
+
 private:
   JitBlock m_blocks[kCacheEntries];
   uint64_t m_recorded;
@@ -71,6 +76,9 @@ private:
   void*    m_rt;          // asmjit::JitRuntime*
 #ifdef JIT_VERIFY
   uint64_t m_v_exec, m_v_fail;
+#endif
+#ifdef JIT_STATS
+  uint64_t m_stat_native, m_stat_interp;
 #endif
 };
 

@@ -747,6 +747,9 @@ void CAlphaCPU::jit_run(int budget)
 			state.r[31] = 0;
 			state.pc = start_virt + 4 * (u64) b->prefix_len;
 			budget -= b->prefix_len;
+#ifdef JIT_STATS
+			m_jit->note_exec(b->prefix_len, 0);
+#endif
 #endif
 			continue;
 		}
@@ -774,6 +777,9 @@ void CAlphaCPU::jit_run(int budget)
 			if (state.pc != expected)
 				break;
 		}
+#ifdef JIT_STATS
+		m_jit->note_exec(0, n);
+#endif
 		if (state.pc != expected)
 		{
 			CJitEngine::JitBlock* nb = m_jit->record(start_virt, start_phys, start_asn, start_asm, n);

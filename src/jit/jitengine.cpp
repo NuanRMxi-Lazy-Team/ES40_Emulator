@@ -63,6 +63,9 @@ CJitEngine::CJitEngine() : m_recorded(0), m_code_bytes(0), m_rt(nullptr)
 #ifdef JIT_VERIFY
   m_v_exec = m_v_fail = 0;
 #endif
+#ifdef JIT_STATS
+  m_stat_native = m_stat_interp = 0;
+#endif
 }
 
 CJitEngine::~CJitEngine()
@@ -225,6 +228,24 @@ void CJitEngine::verify_compare(uint64_t blk_virt, const uint64_t* interp, const
   if ((m_v_exec % 500000) == 0)
     printf("[JIT][VERIFY] %llu compiled-block execs, %llu mismatches\n",
            (unsigned long long) m_v_exec, (unsigned long long) m_v_fail);
+}
+#endif
+
+#ifdef JIT_STATS
+void CJitEngine::note_exec(uint32_t native_instr, uint32_t interp_instr)
+{
+  m_stat_native += native_instr;
+  m_stat_interp += interp_instr;
+  const uint64_t total = m_stat_native + m_stat_interp;
+  if (total >= 100000000)   // report every 100M instructions
+  {
+    printf("[JIT][STATS] native %.1f%% (%llu of %llu instrs), %llu blocks recorded\n",
+           100.0 * (double) m_stat_native / (double) total,
+           (unsigned long long) m_stat_native,
+           (unsigned long long) total,
+           (unsigned long long) m_recorded);
+    m_stat_native = m_stat_interp = 0;
+  }
 }
 #endif
 
