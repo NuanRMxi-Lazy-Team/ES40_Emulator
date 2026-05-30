@@ -793,6 +793,30 @@ void CAlphaCPU::execute()
 	}
 #endif
 
+#ifdef ES40_JIT
+	// The unwound/JIT lane runs one instruction per execute() call and skips the
+	// batch block above, so the Cchip interval-timer poll there never fires.
+	if (state.iProcNum == 0)
+	{
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= next_timer_fire)
+		{
+			cSystem->interrupt(-1, true);
+			const u64 period_ns = theAli ? theAli->get_interval_period_ns() : 0;
+			if (period_ns)
+			{
+				next_timer_fire += std::chrono::nanoseconds(period_ns);
+				if (now - next_timer_fire > std::chrono::seconds(1))
+					next_timer_fire = now;
+			}
+			else
+			{
+				next_timer_fire = now + std::chrono::seconds(1);
+			}
+		}
+	}
+#endif
+
 #if defined(MIPS_ESTIMATE)
 
 	// Calculate simulated performance statistics
