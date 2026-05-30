@@ -223,6 +223,7 @@
 #include "SystemComponent.h"
 #include "System.h"
 #include "cpu_defs.h"
+class CJitEngine;   // JIT block-cache engine (ES40_JIT builds)
 
   /// Number of entries in the Instruction Cache
 #define ICACHE_ENTRIES    1024
@@ -476,6 +477,13 @@ private:
     data_page_cache[1].valid = false;
   }
 
+#ifdef ES40_JIT
+  // JIT block-discovery engine (per-CPU), allocated in init().
+  CJitEngine* m_jit = nullptr;
+  void jit_run(int budget);    // drives the ES40_JIT lane via the interpreter
+  void jit_flush_blocks();     // invalidate all discovered JIT blocks
+#endif
+
   /// The state structure contains all elements that need to be saved to the statefile
   struct SCPU_state
   {
@@ -616,6 +624,9 @@ inline void CAlphaCPU::flush_icache()
     state.last_found_icache = 0;
   }
   break_seq_icache();
+#ifdef ES40_JIT
+  jit_flush_blocks();
+#endif
 }
 
 /**
@@ -631,6 +642,9 @@ inline void CAlphaCPU::flush_icache_asm()
         state.icache[i].valid = false;
   }
   break_seq_icache();
+#ifdef ES40_JIT
+  jit_flush_blocks();
+#endif
 }
 
 /**

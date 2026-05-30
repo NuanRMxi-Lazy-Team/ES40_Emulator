@@ -335,6 +335,7 @@
   **/
 #include "StdAfx.h"
 #include "AlphaCPU.h"
+#include "jit/jitengine.h"
 #include "AliM1543C.h"
 #include "TraceEngine.h"
 #include "lockstep.h"
@@ -391,8 +392,12 @@ void CAlphaCPU::run()
 		{
 			if (StopThread)
 				return;
+#ifdef ES40_JIT
+			jit_run(2000);
+#else
 			for (int i = 0; i < 2000; i++)
 				execute();
+#endif
 			if (cSystem && cSystem->IsSystemResetRequested())
 			{
 				CThread::sleep(1);
@@ -426,6 +431,10 @@ void CAlphaCPU::init()
 	vmspal_lle_enabled = myCfg->get_bool_value("palcode.vms.nohle", false);
 
 	state.iProcNum = cSystem->RegisterCPU(this);
+
+#ifdef ES40_JIT
+	if (!m_jit) m_jit = new CJitEngine();
+#endif
 
 	state.wait_for_start = (state.iProcNum == 0) ? false : true;
 	icache_enabled = true;
@@ -668,6 +677,41 @@ static u64    count;
 static double min_mips = 999999999999999.0;
 static double max_mips = 0.0;
 #include <time.h>
+#endif
+
+#ifdef ES40_JIT
+void CAlphaCPU::jit_flush_blocks()
+{
+	if (m_jit)
+		m_jit->flush();
+}
+
+void CAlphaCPU::jit_run(int budget)
+{
+	while (budget > 0)
+	{
+		const u64 start_virt = state.pc;
+		u64  start_phys = 0;
+		bool have_phys = false;
+		u32  n = 0;
+		u64  expected = start_virt;
+
+		while (budget > 0)
+		{
+			execute();
+			--budget;
+			++n;
+			if (!have_phys) { start_phys = state.pc_phys; have_phys = true; }
+			expected += 4;
+			if (state.pc != expected)   // straight-line run ended (branch/jump/trap)
+				break;
+		}
+
+		// Record only complete blocks (ended by control flow, not budget).
+		if (have_phys && state.pc != expected)
+			m_jit->record(start_phys, start_virt, n);
+	}
+}
 #endif
 
 /**

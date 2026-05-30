@@ -1703,6 +1703,7 @@
     <ClCompile Include="..\AliM1543C_usb.cpp" />
     <ClCompile Include="..\AliM1543C_pmu.cpp" />
     <ClCompile Include="..\AlphaCPU.cpp" />
+    <ClCompile Include="..\jit\jitengine.cpp" />
     <ClCompile Include="..\AlphaCPU_ieeefloat.cpp" />
     <ClCompile Include="..\AlphaCPU_vaxfloat.cpp" />
     <ClCompile Include="..\AlphaCPU_vmspal.cpp" />
@@ -1807,6 +1808,7 @@
     <ClInclude Include="..\gui\gui.h" />
     <ClInclude Include="..\i2c_spd.h" />
     <ClInclude Include="..\ibm8514a.h" />
+    <ClInclude Include="..\jit\jitengine.h" />
     <ClInclude Include="..\Keyboard.h" />
     <ClInclude Include="..\gui\keymap.h" />
     <ClInclude Include="..\lockstep.h" />
