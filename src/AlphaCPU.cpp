@@ -690,26 +690,74 @@ void CAlphaCPU::jit_run(int budget)
 {
 	while (budget > 0)
 	{
+		// Peek the current instruction's physical address for the block lookup.
+		// An I-stream fault (ITB miss -> PAL) just moves PC; re-dispatch.
+		u32 _ins;
+		state.current_pc = state.pc;   // get_icache TB-miss handler reads current_pc
+		if (get_icache(state.pc, &_ins))
+		{
+			--budget;
+			continue;
+		}
+		const u64 start_phys = state.pc_phys;
 		const u64 start_virt = state.pc;
-		u64  start_phys = 0;
-		bool have_phys = false;
+
+		CJitEngine::JitBlock* b = m_jit->lookup(start_phys);
+
+		// Run the compiled safe prefix natively when available.
+		if (b && b->code && (int) b->prefix_len <= budget)
+		{
+#ifdef JIT_VERIFY
+			// Interpret the prefix (authoritative) and compare the compiled result.
+			// Skip the compare if an interrupt/trap diverts us mid-prefix.
+			u64 snap[32];
+			memcpy(snap, state.r, sizeof(snap));
+			u64 vpc = start_virt;
+			bool clean = true;
+			for (u32 k = 0; k < b->prefix_len; ++k)
+			{
+				execute();
+				--budget;
+				vpc += 4;
+				if (state.pc != vpc) { clean = false; break; }
+			}
+			if (clean)
+			{
+				u64 jr[32];
+				memcpy(jr, snap, sizeof(jr));
+				b->code(jr);
+				m_jit->verify_compare(start_virt, state.r, jr);
+			}
+#else
+			b->code(&state.r[0]);
+			state.r[31] = 0;
+			state.pc = start_virt + 4 * (u64) b->prefix_len;
+			budget -= b->prefix_len;
+#endif
+			continue;
+		}
+
+		// Otherwise interpret the block, record it, and compile its safe prefix.
+		u64  sp = 0;
+		bool hp = false;
 		u32  n = 0;
 		u64  expected = start_virt;
-
 		while (budget > 0)
 		{
 			execute();
 			--budget;
 			++n;
-			if (!have_phys) { start_phys = state.pc_phys; have_phys = true; }
+			if (!hp) { sp = state.pc_phys; hp = true; }
 			expected += 4;
-			if (state.pc != expected)   // straight-line run ended (branch/jump/trap)
+			if (state.pc != expected)
 				break;
 		}
-
-		// Record only complete blocks (ended by control flow, not budget).
-		if (have_phys && state.pc != expected)
-			m_jit->record(start_phys, start_virt, n);
+		if (hp && state.pc != expected)
+		{
+			CJitEngine::JitBlock* nb = m_jit->record(sp, start_virt, n);
+			if (!nb->compiled)
+				m_jit->compile_block(nb, (const uint8_t*) dram_ptr, dram_size);
+		}
 	}
 }
 #endif

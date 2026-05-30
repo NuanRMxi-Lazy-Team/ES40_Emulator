@@ -172,3 +172,6 @@
 
 // Comment out to disable bypassing SRM memory checks (doesn't work well down near SRM 7.0 ranges)
 #define SKIP_SRM_MEMTEST
+
+// Define to verify JIT-generated code against a C reference on each compiled block (ES40_JIT builds only). 
+//#define JIT_VERIFY
