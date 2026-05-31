@@ -95,7 +95,10 @@ private:
   uint64_t m_v_exec, m_v_fail;
 #endif
 #ifdef JIT_STATS
-  uint64_t m_stat_native, m_stat_interp;
+  uint64_t m_stat_native, m_stat_interp;        // windowed: instrs run native vs interpreted
+  uint64_t m_stat_hot, m_stat_miss;             // windowed: compiled-chain dispatches, interp blocks
+  uint64_t m_stat_compiled, m_stat_plen_sum;    // cumulative: compiled blocks, sum of their lengths
+  uint64_t m_term_op[64];                       // cumulative: opcode that ended a block's compiled prefix
 #endif
 };
 

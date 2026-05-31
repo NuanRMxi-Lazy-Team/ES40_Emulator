@@ -81,7 +81,9 @@ CJitEngine::CJitEngine() : m_recorded(0), m_code_bytes(0), m_rt(nullptr)
   m_v_exec = m_v_fail = 0;
 #endif
 #ifdef JIT_STATS
-  m_stat_native = m_stat_interp = 0;
+  m_stat_native = m_stat_interp = m_stat_hot = m_stat_miss = 0;
+  m_stat_compiled = m_stat_plen_sum = 0;
+  memset(m_term_op, 0, sizeof(m_term_op));
 #endif
 }
 
@@ -156,7 +158,12 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
          && (phys + (uint64_t) plen * 4) < page_end)
   {
     SafeOp sop = classify(words[plen]);
-    if (sop == OP_NONE) break;          // uncompilable op ends the straight-line prefix
+    if (sop == OP_NONE) {               // uncompilable op ends the straight-line prefix
+#ifdef JIT_STATS
+      m_term_op[words[plen] >> 26]++;   // tally what cut this block (the coverage gap to chase)
+#endif
+      break;
+    }
     plen++;
     if (is_branch(sop)) { terminator_branch = true; break; }   // a branch terminates the block
   }
@@ -449,6 +456,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
   b->jit_body = (void*) ((uint8_t*) (void*) fn + body_off);   // chained re-entry (past prologue)
   b->prefix_len = plen;
   m_code_bytes += csz;   // track for the reclaim threshold (see flush())
+#ifdef JIT_STATS
+  m_stat_compiled++;
+  m_stat_plen_sum += plen;
+#endif
 }
 
 #ifdef JIT_VERIFY
@@ -471,20 +482,52 @@ void CJitEngine::verify_compare(uint64_t blk_virt, const uint64_t* interp, const
 #endif
 
 #ifdef JIT_STATS
+// Short mnemonic for the opcode that ended a block's compiled prefix (the coverage gap).
+static const char* opcode_name(unsigned op)
+{
+  switch (op) {
+    case 0x00: return "CALL_PAL";
+    case 0x08: return "LDA";   case 0x09: return "LDAH"; case 0x0a: return "LDBU";  case 0x0b: return "LDQ_U";
+    case 0x0c: return "LDWU";  case 0x0d: return "STW";  case 0x0e: return "STB";   case 0x0f: return "STQ_U";
+    case 0x10: return "INTA";  case 0x11: return "INTL"; case 0x12: return "INTS";  case 0x13: return "INTM";
+    case 0x14: return "ITFP";  case 0x15: return "FLTV"; case 0x16: return "FLTI";  case 0x17: return "FLTL";
+    case 0x18: return "MISC";  case 0x19: return "HWMFPR";case 0x1a: return "JMP";   case 0x1b: return "HWLD";
+    case 0x1c: return "FPTI";  case 0x1d: return "HWMTPR";case 0x1e: return "HWREI"; case 0x1f: return "HWST";
+    case 0x20: return "LDF";   case 0x21: return "LDG";  case 0x22: return "LDS";   case 0x23: return "LDT";
+    case 0x24: return "STF";   case 0x25: return "STG";  case 0x26: return "STS";   case 0x27: return "STT";
+    case 0x2a: return "LDL_L"; case 0x2b: return "LDQ_L";case 0x2e: return "STL_C"; case 0x2f: return "STQ_C";
+    default:   return "op";
+  }
+}
+
 void CJitEngine::note_exec(uint32_t native_instr, uint32_t interp_instr)
 {
   m_stat_native += native_instr;
   m_stat_interp += interp_instr;
+  if (native_instr) m_stat_hot++;     // one compiled-chain dispatch
+  if (interp_instr) m_stat_miss++;    // one interpreted (cold/uncompilable) block
   const uint64_t total = m_stat_native + m_stat_interp;
-  if (total >= 100000000)   // report every 100M instructions
-  {
-    printf("[JIT][STATS] native %.1f%% (%llu of %llu instrs), %llu blocks recorded\n",
-           100.0 * (double) m_stat_native / (double) total,
-           (unsigned long long) m_stat_native,
-           (unsigned long long) total,
-           (unsigned long long) m_recorded);
-    m_stat_native = m_stat_interp = 0;
+  if (total < 100000000) return;      // report every 100M instructions
+
+  const double chain = m_stat_hot ? (double) m_stat_native / (double) m_stat_hot : 0.0;
+  const double avgpl = m_stat_compiled ? (double) m_stat_plen_sum / (double) m_stat_compiled : 0.0;
+  printf("[JIT][STATS] native %.1f%% (%llu/%llu) | chain avg %.1f instr over %llu dispatches | interp %llu blks\n",
+         100.0 * (double) m_stat_native / (double) total,
+         (unsigned long long) m_stat_native, (unsigned long long) total,
+         chain, (unsigned long long) m_stat_hot, (unsigned long long) m_stat_miss);
+  printf("[JIT][STATS] %llu recorded, %llu compiled (avg %.1f instr) | block-breakers:",
+         (unsigned long long) m_recorded, (unsigned long long) m_stat_compiled, avgpl);
+  uint64_t hist[64];
+  memcpy(hist, m_term_op, sizeof(hist));
+  for (int rank = 0; rank < 8; ++rank) {
+    int best = -1; uint64_t bestv = 0;
+    for (int op = 0; op < 64; ++op) if (hist[op] > bestv) { bestv = hist[op]; best = op; }
+    if (best < 0) break;
+    printf(" %s(0x%02x)=%llu", opcode_name(best), best, (unsigned long long) bestv);
+    hist[best] = 0;
   }
+  printf("\n");
+  m_stat_native = m_stat_interp = m_stat_hot = m_stat_miss = 0;   // reset the window
 }
 #endif
 
