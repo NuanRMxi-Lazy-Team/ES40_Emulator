@@ -63,7 +63,10 @@ SafeOp classify(uint32_t ins)
       break;
     case 0x08: return OP_LDA;   // load address (Ra = Rb + disp16) -- pure ALU, no memory
     case 0x09: return OP_LDAH;  // load address high (Ra = Rb + (disp16 << 16))
-    case 0x1a: return OP_JMP;   // JMP/JSR/RET/JSR_CO: Ra = PC+4; PC = Rb & ~3 (hint ignored)
+    // NOTE: 0x1a (JMP/JSR/RET) intentionally NOT compiled. It's a terminator (can't lengthen
+    // blocks), its targets vary so the single-slot link cache thrashes (no chaining), and the
+    // chains are cut by CALL_PAL/MISC anyway -- compiling it measured as a net regression. The
+    // OP_JMP codegen/verify paths below stay dormant; revisit once per-dispatch overhead drops.
     case 0x28: return OP_LDL;   // memory-format loads (Ra = MEM[Rb+disp16])
     case 0x29: return OP_LDQ;
     case 0x2c: return OP_STL;   // memory-format stores (MEM[Rb+disp16] = Ra)
@@ -160,7 +163,8 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
   // there would be the wrong instructions. (The page-crossing case verify caught.)
   const uint64_t page_end = (phys & ~(uint64_t) 0x1FFF) + 0x2000;
   uint32_t plen = 0;
-  bool terminator_branch = false;       // last instruction is a compiled branch (sets its own PC)
+  bool terminator_branch = false;       // last instruction is a compiled terminator (sets its own PC)
+  bool terminator_jmp = false;          // ...and it's a computed jump (don't chain: targets vary)
   while (plen < b->n_instr && plen < 64
          && (phys + (uint64_t) plen * 4) < page_end)
   {
@@ -172,7 +176,11 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       break;
     }
     plen++;
-    if (is_terminator(sop)) { terminator_branch = true; break; }   // branch or computed jump ends it
+    if (is_terminator(sop)) {           // branch or computed jump ends the block
+      terminator_branch = true;
+      if (sop == OP_JMP) terminator_jmp = true;
+      break;
+    }
   }
   if (plen == 0) return;
 
@@ -448,7 +456,13 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     // fall through to lbl (return to dispatcher)
   };
 #endif
-  if (terminator_branch) {
+  if (terminator_jmp) {
+    // Computed jump: the JMP codegen already wrote state.pc to the (register) target. Don't
+    // chain it -- targets vary (returns/dispatch), so the single-slot cache thrashes, costing
+    // more than the dispatcher round-trip it would save (measured regression). Just count the
+    // block and return; the dispatcher resolves the target (and may run a fresh chain there).
+    a.add(x86::r14d, imm(plen));
+  } else if (terminator_branch) {
     a.add(x86::r14d, imm(plen));   // R10 still holds the next PC (branch wrote state.pc + R10)
 #ifndef JIT_VERIFY
     Label exit_chain = a.new_label();

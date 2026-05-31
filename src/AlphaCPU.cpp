@@ -1475,11 +1475,37 @@ void CAlphaCPU::execute()
 #endif
 		}
 #else
-		// Simple fetch path for unwound/JIT lane 
-		seq_remaining = 0;
+		// Fast sequential icache path -- the same fast path the batched interpreter uses above.
+		// The JIT lane calls execute() once per instruction, so this cursor persists across calls
+		// within an interpreted run. A compiled block can't remap (it runs no PAL/TB ops), and any
+		// flush or IMB resets the cursor through break_seq_icache(), so stale lines can't be read.
+		// A TB-miss returns to the dispatcher (which re-dispatches at the fault handler).
+		if (state.pc == seq_next_pc && seq_remaining > 0)
+		{
+			ins = endian_32(seq_line_ptr[seq_offset]);
+			seq_offset++;
+			seq_remaining--;
+			seq_next_pc += 4;
+		}
+		else
+		{
+			if (get_icache(state.pc, &ins))
+				return;
 
-		if (get_icache(state.pc, &ins))
-			return;
+			if (icache_enabled && !(state.pc & 1))
+			{
+				int _siq_line = state.last_found_icache;
+				seq_line_ptr = state.icache[_siq_line].data;
+				int _siq_word = (int) ((state.pc >> 2) & ICACHE_INDEX_MASK);
+				seq_offset = _siq_word + 1;
+				seq_remaining = ICACHE_LINE_SIZE - seq_offset;
+				seq_next_pc = (state.pc & ~U64(0x3)) + 4;
+			}
+			else
+			{
+				seq_remaining = 0;
+			}
+		}
 
 #if defined(IDB)
 		current_pc_physical = state.pc_phys;
