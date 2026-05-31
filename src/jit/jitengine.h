@@ -72,7 +72,7 @@ public:
   }
 
   JitBlock* record(uint64_t virt_pc, uint64_t phys_pc, uint32_t asn, bool asm_global, uint32_t n_instr);
-  void compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper);
+  void compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper);
   void flush();
 
 #ifdef JIT_VERIFY

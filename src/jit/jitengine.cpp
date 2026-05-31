@@ -17,11 +17,13 @@ enum SafeOp {
   OP_CMPEQ, OP_CMPLT, OP_CMPLE, OP_CMPULT, OP_CMPULE,
   OP_SLL, OP_SRL, OP_SRA, OP_MULQ,
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
+  OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
   // Branch-format terminators (contiguous; see is_branch). Conditional on Ra, plus BR/BSR.
   OP_BEQ, OP_BNE, OP_BLT, OP_BLE, OP_BGT, OP_BGE, OP_BLBC, OP_BLBS, OP_BR, OP_BSR
 };
 
 static inline bool is_branch(SafeOp op) { return op >= OP_BEQ && op <= OP_BSR; }
+static inline bool is_store(SafeOp op)  { return op == OP_STQ || op == OP_STL; }
 
 // Safe = goto-free, register-only operate-format ops (no trap, memory, or branch).
 SafeOp classify(uint32_t ins)
@@ -57,6 +59,8 @@ SafeOp classify(uint32_t ins)
       break;
     case 0x28: return OP_LDL;   // memory-format loads (Ra = MEM[Rb+disp16])
     case 0x29: return OP_LDQ;
+    case 0x2c: return OP_STL;   // memory-format stores (MEM[Rb+disp16] = Ra)
+    case 0x2d: return OP_STQ;
     // Branch format: opcode | Ra | disp21. Conditional on Ra, plus BR/BSR.
     case 0x30: return OP_BR;    case 0x34: return OP_BSR;
     case 0x38: return OP_BLBC;  case 0x39: return OP_BEQ;
@@ -130,7 +134,7 @@ void CJitEngine::flush()
   }
 }
 
-void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper)
+void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper)
 {
   using namespace asmjit;
   b->compiled = true;
@@ -267,6 +271,32 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       emit_helper();
       a.bind(ldone);
 #endif
+      continue;
+    }
+
+    // Memory-format stores: MEM[regs[Rb] + disp16] = regs[Ra]. Via jit_write(cpu,va,size,
+    // value): in verify it compares against the interpreter's recorded store (stores touch
+    // memory, not GPRs), in production it writes (side-effect-free cache translation, bail
+    // on miss). On a fault, bail like a load. (Inline write fast path is a follow-up.)
+    if (op == OP_STL || op == OP_STQ) {
+      const int disp = (int) (int16_t) (ins & 0xFFFF);
+      const int size_bits = (op == OP_STQ) ? 64 : 32;
+      if (rb == 31)  a.mov(x86::rdx, imm(disp));                       // va -> RDX
+      else        {  a.mov(x86::rdx, reg(rb)); if (disp) a.add(x86::rdx, imm(disp)); }
+      if (ra == 31)  a.xor_(x86::r9d, x86::r9d);                       // value -> R9 (R31 == 0)
+      else           a.mov(x86::r9, reg(ra));
+      a.mov(x86::rcx, x86::rsi);                                       // cpu
+      a.mov(x86::r8d, imm(size_bits));                                 // size in bits
+      a.mov(x86::rax, imm((uint64_t) write_helper));
+      a.call(x86::rax);                                               // jit_write(cpu, va, size, value)
+      Label ok = a.new_label();
+      a.test(x86::eax, x86::eax);
+      a.jz(ok);
+      set_pc(b->tag + 4 * (uint64_t) i);                              // resume at the faulting store
+      a.mov(x86::eax, imm(i));                                         // this iteration: i instrs done
+      a.add(x86::eax, x86::r14d);                                      // + earlier chained iterations
+      a.jmp(done);
+      a.bind(ok);
       continue;
     }
 

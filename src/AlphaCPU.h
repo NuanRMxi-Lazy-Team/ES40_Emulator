@@ -484,15 +484,21 @@ private:
   void* m_link_from = nullptr; // JitBlock* whose successor link the dispatcher should patch
   void jit_run(int budget);    // drives the ES40_JIT lane via the interpreter
   void jit_flush_blocks();     // invalidate all discovered JIT blocks
-  // Compiled-block memory helper: read size_bits from va into *out; returns 0 on
-  // success, 1 on fault/unaligned.
+  // Compiled-block memory helpers: load size_bits from va into *out / store value to va.
+  // Return 0 on success, 1 on fault/unaligned (caller bails to the interpreter).
   static int jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out);
+  static int jit_write(CAlphaCPU* cpu, u64 va, int size_bits, u64 value);
   // Verify support: the interpreter pass records each value it loads, and the
   // compiled pass replays them instead of re-reading memory - false mismatch fix
   bool m_jit_vreplay = false;  // compiled pass: replay recorded loads, don't re-read
   u32  m_jit_vlog_i  = 0;      // replay cursor
   u64  m_jit_vlog[64];         // values the interpreter pass loaded (<= prefix_len)
   u64  m_jit_vaddr[64];        // diagnostic: load addresses the interpreter computed
+  // Store verify: the interpreter pass records each store (addr,value); the compiled
+  // pass compares against it (stores touch memory, not GPRs, so the GPR check can't see them).
+  u32  m_jit_slog_i  = 0;      // store-compare cursor
+  u64  m_jit_slog_addr[64];    // store addresses the interpreter pass wrote
+  u64  m_jit_slog_val[64];     // store values the interpreter pass wrote
 #endif
 
   /// The state structure contains all elements that need to be saved to the statefile

@@ -767,7 +767,8 @@ void CAlphaCPU::jit_run(int budget)
 			u64 snap[32];
 			memcpy(snap, state.r, sizeof(snap));
 			const u32* vw = (const u32*) ((const u8*) dram_ptr + b->phys);
-			u32 vn = 0;
+			u32 vn = 0;   // loads recorded for replay
+			u32 sn = 0;   // stores recorded for the compiled-pass compare
 			u64 vpc = start_virt;
 			bool clean = true;
 			for (u32 k = 0; k < b->prefix_len; ++k)
@@ -784,6 +785,17 @@ void CAlphaCPU::jit_run(int budget)
 					const int lrb = (ins >> 16) & 0x1F;
 					const int ldisp = (int) (int16_t) (ins & 0xFFFF);
 					eva = (lrb == 31 ? (u64) 0 : state.r[lrb]) + (u64) ldisp;
+				}
+				// Stores touch memory, not GPRs, so record (addr,value) for the compiled-pass
+				// compare. Ra (lra) is the value source; Rb is the base.
+				const bool isst = (opc == 0x2c || opc == 0x2d);
+				u64 sva = 0, sval = 0;
+				if (isst)
+				{
+					const int srb = (ins >> 16) & 0x1F;
+					const int sdisp = (int) (int16_t) (ins & 0xFFFF);
+					sva  = (srb == 31 ? (u64) 0 : state.r[srb]) + (u64) sdisp;
+					sval = (lra == 31 ? (u64) 0 : state.r[lra]);
 				}
 				execute();
 				--budget;
@@ -815,6 +827,12 @@ void CAlphaCPU::jit_run(int budget)
 					m_jit_vlog[vn] = state.r[lra];
 					vn++;
 				}
+				if (isst && sn < 64)
+				{
+					m_jit_slog_addr[sn] = sva;
+					m_jit_slog_val[sn]  = sval;
+					sn++;
+				}
 			}
 			if (clean)
 			{
@@ -823,6 +841,7 @@ void CAlphaCPU::jit_run(int budget)
 				const u64 interp_pc = state.pc;   // interpreter is authoritative for the PC
 				m_jit_vreplay = true;
 				m_jit_vlog_i = 0;
+				m_jit_slog_i = 0;
 				const u32 done = b->code(this, jr);   // also writes state.pc (the JIT's next PC)
 				m_jit_vreplay = false;
 				if (done == b->prefix_len)
@@ -897,7 +916,8 @@ void CAlphaCPU::jit_run(int budget)
 		{
 			CJitEngine::JitBlock* nb = m_jit->record(start_virt, start_phys, start_asn, start_asm, n);
 			if (!nb->compiled)
-				m_jit->compile_block(nb, (const uint8_t*) dram_ptr, dram_size, (void*) &CAlphaCPU::jit_read);
+				m_jit->compile_block(nb, (const uint8_t*) dram_ptr, dram_size,
+				                     (void*) &CAlphaCPU::jit_read, (void*) &CAlphaCPU::jit_write);
 		}
 	}
 }
@@ -958,6 +978,64 @@ int CAlphaCPU::jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
 		*out = dram_read(cpu->dram_ptr, phys, size_bits);
 	else
 		*out = cpu->cSystem->ReadMem(phys, size_bits, cpu);
+	return 0;
+}
+
+// JIT store helper (static). Writes size_bits of value to virtual address va, mirroring
+// jit_read's side-effect-free translation. Returns 0 on success, 1 on fault/unaligned.
+int CAlphaCPU::jit_write(CAlphaCPU* cpu, u64 va, int size_bits, u64 value)
+{
+	const u64 amask = (u64) (size_bits / 8) - 1;
+	if (va & amask) return 1;                 // unaligned: let the interpreter handle it
+
+	// Verify: the interpreter pass already performed (and recorded) this store. Compare
+	// rather than write -- stores change memory, not GPRs, so the differential GPR check
+	// can't see them; this is how compiled stores get validated.
+	if (cpu->m_jit_vreplay)
+	{
+		const u32 i = cpu->m_jit_slog_i++;
+		if (va != cpu->m_jit_slog_addr[i] || value != cpu->m_jit_slog_val[i])
+		{
+			static int n = 0;
+			if (n++ < 50)
+				printf("[JIT] STORE MISMATCH: compiled va=%016llx val=%016llx  interp va=%016llx val=%016llx\n",
+				       (unsigned long long) va, (unsigned long long) value,
+				       (unsigned long long) cpu->m_jit_slog_addr[i], (unsigned long long) cpu->m_jit_slog_val[i]);
+		}
+		return 0;
+	}
+
+	u64 phys;
+	const u64 vp = va & ~U64(0x1FFF);
+	if (cpu->data_page_cache[1].valid
+	    && cpu->data_page_cache[1].virt_page == vp
+	    && cpu->data_page_cache[1].cm  == cpu->state.cm
+	    && cpu->data_page_cache[1].asn == cpu->state.asn0)
+	{
+		phys = cpu->data_page_cache[1].phys_base | (va & U64(0x1FFF));
+	}
+	else
+	{
+		// Side-effect-free TB fast path on the write cache [1]; bail on a TB miss or access
+		// fault so the interpreter does the side-effecting translation (filling this cache,
+		// so the next compiled run hits). NOT virt2phys -- it vectors faults as a side effect.
+		const int i = cpu->FindTBEntry(va, ACCESS_WRITE);
+		if (i < 0) return 1;                                                  // TB miss
+		const auto& e = cpu->state.tb[TB_INDEX_DATA][i];
+		if (!e.access[1][cpu->state.cm]) return 1;                            // protection (ACV)
+		if (e.fault[1]) return 1;                                             // fault-on-write (FOW)
+		phys = e.phys | (va & e.keep_mask);
+		cpu->data_page_cache[1].virt_page = vp;
+		cpu->data_page_cache[1].phys_base = phys & ~U64(0x1FFF);
+		cpu->data_page_cache[1].cm  = cpu->state.cm;
+		cpu->data_page_cache[1].asn = cpu->state.asn0;
+		cpu->data_page_cache[1].valid = true;
+	}
+
+	if (phys < cpu->dram_size)
+		dram_write(cpu->dram_ptr, phys, size_bits, value);
+	else
+		cpu->cSystem->WriteMem(phys, size_bits, value, cpu);
 	return 0;
 }
 #endif
