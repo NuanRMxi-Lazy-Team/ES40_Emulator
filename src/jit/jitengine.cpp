@@ -16,6 +16,7 @@ enum SafeOp {
   OP_AND, OP_BIS, OP_XOR, OP_BIC, OP_ORNOT, OP_EQV,
   OP_CMPEQ, OP_CMPLT, OP_CMPLE, OP_CMPULT, OP_CMPULE,
   OP_SLL, OP_SRL, OP_SRA, OP_MULQ,
+  OP_NOP, OP_MFENCE,             // MISC (0x18): prefetch/cache hints (no-op), barriers (mfence)
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
   OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
   OP_LDA, OP_LDAH,               // load-address: Ra = Rb + disp16 (<<16 for LDAH); pure ALU
@@ -62,6 +63,14 @@ SafeOp classify(uint32_t ins)
     case 0x13: // INTM
       if (func == 0x20) return OP_MULQ;
       break;
+    case 0x18: // MISC: memory barriers -> mfence (keep MP ordering); prefetch/cache hints -> no-op
+      switch (ins & 0xFFFF) {
+        case 0x0000: case 0x0400:                    // TRAPB, EXCB
+        case 0x4000: case 0x4400: return OP_MFENCE;  // MB, WMB
+        case 0x8000: case 0xA000: case 0xE800:       // FETCH, FETCH_M, ECB
+        case 0xF800: case 0xFC00: return OP_NOP;     // WH64, WH64EN
+      }
+      break;                    // RPCC (0xc000) / RC / RS read state or have side effects -> interpret
     case 0x00: {                // CALL_PAL: compile valid standard funcs (priv 0x00-0x3f, unpriv 0x80-0xbf)
       const uint32_t fn = ins & 0x1FFFFFFF;
       if (fn <= 0x3F || (fn >= 0x80 && fn <= 0xBF)) return OP_CALL_PAL;
@@ -243,6 +252,12 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     int rc = ins & 0x1F;
     bool islit = ((ins >> 12) & 1) != 0;
     uint32_t lit = (ins >> 13) & 0xFF;
+
+    // MISC (0x18) barriers/hints: emit an mfence for TRAPB/EXCB/MB/WMB (x86's seq_cst fence, to
+    // preserve the guest's MP memory ordering, matching DO_*'s atomic_thread_fence), nothing for
+    // the prefetch/cache hints -- then keep going so the block extends straight past them.
+    if (op == OP_NOP)    continue;
+    if (op == OP_MFENCE) { a.mfence(); continue; }
 
     auto reg = [&](int r) {
       // PALshadow (RREG, AlphaCPU.h): in a PALmode block with SDE set, R4-7 and R20-23 map to
