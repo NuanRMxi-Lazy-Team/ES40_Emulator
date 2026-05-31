@@ -717,11 +717,19 @@ void CAlphaCPU::jit_flush_blocks()
 
 void CAlphaCPU::jit_run(int budget)
 {
+	const auto now = std::chrono::steady_clock::now();
+	const auto cc_delta = now - cc_last_sync;
+	cc_last_sync = now;
+	// Wall-clock RPCC: advance the cycle counter by real elapsed time * cpu_hz (when enabled) so
+	// it tracks the configured CPU frequency no matter how fast/bursty the JIT runs 
+	// The <1s guard skips odd deltas (first call / reset / pause), like the timer catch-up below.
+	if (state.cc_ena && cc_delta < std::chrono::seconds(1))
+		state.cc += (u64) std::chrono::duration_cast<std::chrono::nanoseconds>(cc_delta).count() * cpu_hz / 1000000000ULL;
+
 	// Drive the Cchip interval timer once per dispatch batch (CPU0 only), not
 	// once per instruction the way the in-execute() poll did.
 	if (state.iProcNum == 0)
 	{
-		const auto now = std::chrono::steady_clock::now();
 		if (now >= next_timer_fire)
 		{
 			cSystem->interrupt(-1, true);
@@ -909,13 +917,12 @@ void CAlphaCPU::jit_run(int budget)
 			const u32 done = b->code(this, &state.r[0]);
 			state.r[31] = 0;
 			// state.pc is written by the compiled block itself (next PC, or the bail PC).
-			// Match the interpreter's per-instruction accounting for the compiled ops:
-			// cycle counter (RPCC) and instruction count. Skipping it stalls state.cc and
-			// breaks guest timing -- and the verify can't catch it (these are IPRs, not GPRs).
+			// Account for the compiled ops: instruction count (+ cc_large for the legacy speed
+			// calibration). state.cc (RPCC) is no longer advanced per-instruction. 
+			// wall-clock * cpu_hz at the jit_run boundary above, so a hot compiled loop can't
+			// run the cycle counter ahead of real time 
 			state.instruction_count += done;
 			cc_large += (u64) done * cc_per_instruction;
-			if (state.cc_ena)
-				state.cc += (u64) done * cc_per_instruction;
 			budget -= done;
 #ifdef JIT_STATS
 			m_jit->note_exec(done, 0);
@@ -1366,8 +1373,8 @@ void CAlphaCPU::execute()
 
 		state.instruction_count++;
 		cc_large += _cc_per_ins;
-		if (state.cc_ena)
-			state.cc += _cc_per_ins;
+		// state.cc (RPCC) is pinned to wall-clock * cpu_hz at the jit_run boundary, not advanced
+		// per-instruction here - interpreter can't run RPCC ahead of wall time.
 
 		// Process delayed irq_h timers one instruction at a time.
 		if (state.check_timers)

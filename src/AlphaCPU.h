@@ -447,7 +447,12 @@ private:
   // edge coalescing seen with AliM1543C-thread firing.
   std::chrono::steady_clock::time_point next_timer_fire;
 
-  // DRAM fast-path cache 
+  // Wall-clock RPCC: state.cc advances by real elapsed time * cpu_hz so it tracks the configured
+  // CPU frequency regardless of how fast/bursty the JIT runs. This is the last sync timestamp;
+  // the delta since it (when cc_ena) is added to state.cc each jit_run, then it's reset to now.
+  std::chrono::steady_clock::time_point cc_last_sync;
+
+  // DRAM fast-path cache
   char* dram_ptr;    // cSystem->PtrToMem(0) - host pointer to base es40 ram array thingy
   u64    dram_size;   // 1ULL << cSystem->get_memory_bits() — size of DRAM in bytes
 
