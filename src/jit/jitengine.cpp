@@ -18,6 +18,7 @@ enum SafeOp {
   OP_SLL, OP_SRL, OP_SRA, OP_MULQ,
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
   OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
+  OP_LDA, OP_LDAH,               // load-address: Ra = Rb + disp16 (<<16 for LDAH); pure ALU
   // Branch-format terminators (contiguous; see is_branch). Conditional on Ra, plus BR/BSR.
   OP_BEQ, OP_BNE, OP_BLT, OP_BLE, OP_BGT, OP_BGE, OP_BLBC, OP_BLBS, OP_BR, OP_BSR
 };
@@ -57,6 +58,8 @@ SafeOp classify(uint32_t ins)
     case 0x13: // INTM
       if (func == 0x20) return OP_MULQ;
       break;
+    case 0x08: return OP_LDA;   // load address (Ra = Rb + disp16) -- pure ALU, no memory
+    case 0x09: return OP_LDAH;  // load address high (Ra = Rb + (disp16 << 16))
     case 0x28: return OP_LDL;   // memory-format loads (Ra = MEM[Rb+disp16])
     case 0x29: return OP_LDQ;
     case 0x2c: return OP_STL;   // memory-format stores (MEM[Rb+disp16] = Ra)
@@ -304,6 +307,18 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       a.add(x86::eax, x86::r14d);                                      // + earlier chained iterations
       a.jmp(done);
       a.bind(ok);
+      continue;
+    }
+
+    // Load-address: Ra = Rb + disp16 (LDA) or Rb + (disp16 << 16) (LDAH). Pure register
+    // arithmetic. R31 dest discards the result (a NOP).
+    if (op == OP_LDA || op == OP_LDAH) {
+      if (ra == 31) continue;
+      int64_t d = (int64_t) (int16_t) (ins & 0xFFFF);
+      if (op == OP_LDAH) d <<= 16;
+      if (rb == 31)  a.mov(x86::rax, imm(d));
+      else        {  a.mov(x86::rax, reg(rb)); if (d) a.add(x86::rax, imm(d)); }
+      a.mov(reg(ra), x86::rax);
       continue;
     }
 
