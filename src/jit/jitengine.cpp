@@ -83,6 +83,9 @@ SafeOp classify(uint32_t ins)
 
 } // namespace
 
+// Defined further down; forward-declared so compile_block's punch-list print can use it.
+static const char* opcode_name(unsigned op);
+
 CJitEngine::CJitEngine() : m_recorded(0), m_code_bytes(0), m_rt(nullptr)
 {
   flush();                                  // clears valid bits (m_rt still null)
@@ -95,6 +98,7 @@ CJitEngine::CJitEngine() : m_recorded(0), m_code_bytes(0), m_rt(nullptr)
   m_stat_compiled = m_stat_plen_sum = 0;
   memset(m_term_op, 0, sizeof(m_term_op));
   memset(m_pal_func, 0, sizeof(m_pal_func));
+  m_first_breaker_logged = false;
 #endif
 }
 
@@ -152,12 +156,16 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
   using namespace asmjit;
   b->compiled = true;
 
-  // Only non-PALmode blocks: there RREG(a)==a, so direct state.r[reg] access is
-  // correct. PALmode (PC bit 0) can remap R4-7/R20-23 to the shadow bank.
-  if (b->tag & 1) return;
   uint64_t phys = b->phys;
   if (b->n_instr == 0 || phys + (uint64_t) b->n_instr * 4 > dram_size) return;
   const uint32_t* words = (const uint32_t*) (dram + phys);   // x86 LE == Alpha LE
+
+  // PALmode blocks (PC bit 0) can remap R4-7/R20-23 to the shadow bank (see RREG), so direct
+  // state.r[reg] access isn't valid there. 
+  const bool pal_block = (b->tag & 1) != 0;
+#ifndef JIT_STATS
+  if (pal_block) return;
+#endif
 
   // Stop at the 8 KB page boundary: past it the next instruction's physical
   // address need not be phys+4 (the next virtual page maps elsewhere), so words[]
@@ -172,9 +180,18 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     SafeOp sop = classify(words[plen]);
     if (sop == OP_NONE) {               // uncompilable op ends the straight-line prefix
 #ifdef JIT_STATS
-      m_term_op[words[plen] >> 26]++;   // tally what cut this block (the coverage gap to chase)
-      if ((words[plen] >> 26) == 0x00)  // CALL_PAL: also tally the function code (low 8 bits)
+      const uint32_t bop = words[plen] >> 26;
+      m_term_op[bop]++;                 // tally what cut this block (the coverage gap to chase)
+      if (bop == 0x00)                  // CALL_PAL: also tally the function code (low 8 bits)
         m_pal_func[words[plen] & 0xFF]++;
+      // Punch list: one-shot print of the first ACTIONABLE breaker
+      if (!m_first_breaker_logged && bop != 0x1a && bop != 0x00) {
+        m_first_breaker_logged = true;
+        printf("[JIT][PUNCH] first unhandled breaker: %s(0x%02x) ins=%08x at pc=%016llx%s\n",
+               opcode_name(bop), bop, words[plen],
+               (unsigned long long) ((b->tag & ~(uint64_t) 1) + (uint64_t) plen * 4),
+               pal_block ? "  [PALmode]" : "");
+      }
 #endif
       break;
     }
@@ -185,6 +202,9 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       break;
     }
   }
+
+  // PALmode blocks were scanned above - Interpret them
+  if (pal_block) return;
   if (plen == 0) return;
 
   // Emit  uint32_t fn(CAlphaCPU* cpu, uint64_t* regs)  (Win64: cpu=RCX, regs=RDX).
@@ -223,7 +243,13 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     bool islit = ((ins >> 12) & 1) != 0;
     uint32_t lit = (ins >> 13) & 0xFF;
 
-    auto reg = [&](int r) { return x86::qword_ptr(x86::rbx, r * 8); };
+    auto reg = [&](int r) {
+      // PALshadow (RREG, AlphaCPU.h): in a PALmode block with SDE set, R4-7 and R20-23 map to
+      // the shadow bank r[r+32]. 
+      int idx = r;
+      if (pal_block && ((r & 0xc) == 0x4)) idx = r + 32;
+      return x86::qword_ptr(x86::rbx, idx * 8);
+    };
     auto op1_rax = [&]() {
       if (ra == 31) a.xor_(x86::eax, x86::eax);
       else          a.mov(x86::rax, reg(ra));
