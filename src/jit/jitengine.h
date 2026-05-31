@@ -50,6 +50,9 @@ public:
   struct JitOffsets {
     uint32_t dpc_valid, dpc_virt_page, dpc_phys_base, dpc_cm, dpc_asn;
     uint32_t state_cm, state_asn0, dram_ptr, dram_size, state_pc;
+    // For self-loop chaining: the budget ceiling and the interrupt-poll flags the
+    // compiled epilogue checks before looping back to its own body entry.
+    uint32_t jit_budget, check_int, check_timers;
   };
   void set_offsets(const JitOffsets& o) { m_off = o; }
 

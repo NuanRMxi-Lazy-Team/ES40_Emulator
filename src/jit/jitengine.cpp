@@ -163,11 +163,15 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
   x86::Assembler a(&code);
   a.push(x86::rbx);
   a.push(x86::rsi);
-  a.sub(x86::rsp, imm(40));
+  a.push(x86::r14);            // callee-saved: accumulates the chain's instruction count
+  a.sub(x86::rsp, imm(48));    // 32 shadow + load-out slot; keeps RSP 16-aligned at calls
   a.mov(x86::rsi, x86::rcx);   // cpu
   a.mov(x86::rbx, x86::rdx);   // regs base
+  a.xor_(x86::r14d, x86::r14d);   // instruction count := 0
 
-  Label done = a.new_label();  // shared bail/return target
+  Label done = a.new_label();  // shared exit: restore frame + ret (EAX preset by caller)
+  Label body = a.new_label();  // self-loop re-entry (after the prologue; preserves R14)
+  a.bind(body);
 
   // The compiled block computes its own next PC into state.pc at every exit (the
   // foundation for branch compilation and block linking). R10 is scratch here.
@@ -218,7 +222,8 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
         a.test(x86::eax, x86::eax);
         a.jz(ok);
         set_pc(b->tag + 4 * (uint64_t) i);               // resume at the faulting load
-        a.mov(x86::eax, imm(i));                          // fault: bail, i instrs done
+        a.mov(x86::eax, imm(i));                          // this iteration: i instrs done
+        a.add(x86::eax, x86::r14d);                       // + earlier chained iterations
         a.jmp(done);
         a.bind(ok);
         if (op == OP_LDQ) a.mov(x86::rax, x86::qword_ptr(x86::rsp, 32));
@@ -335,11 +340,32 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
 
     if (rc != 31) a.mov(reg(rc), x86::rax);
   }
-  // Next PC: a branch terminator already wrote it; otherwise it's the fall-through.
-  if (!terminator_branch) set_pc(b->tag + 4 * (uint64_t) plen);
-  a.mov(x86::eax, imm(plen));   // no fault: all instructions completed
-  a.bind(done);
-  a.add(x86::rsp, imm(40));
+  // Epilogue. Count this block's instructions, then either loop back into our own body
+  // (self-loop: the terminator branch targets our own start) or return to the dispatcher.
+  if (terminator_branch) {
+    // R10 still holds the next PC (the branch codegen left it there and wrote state.pc).
+    a.add(x86::r14d, imm(plen));
+#ifndef JIT_VERIFY
+    // Self-loop: when the taken branch returns to our own start (r10 == b->tag) and we
+    // still have budget and no pending interrupt/timer, jump straight back into the body
+    // rather than round-tripping through the C dispatcher.
+    Label exit_chain = a.new_label();
+    a.mov(x86::rax, imm(b->tag));                                // tag may exceed imm32
+    a.cmp(x86::r10, x86::rax);                                   a.jne(exit_chain);
+    a.cmp(x86::r14, x86::qword_ptr(x86::rsi, m_off.jit_budget)); a.jge(exit_chain);
+    a.cmp(x86::byte_ptr(x86::rsi, m_off.check_int), imm(0));     a.jne(exit_chain);
+    a.cmp(x86::byte_ptr(x86::rsi, m_off.check_timers), imm(0));  a.jne(exit_chain);
+    a.jmp(body);
+    a.bind(exit_chain);
+#endif
+  } else {
+    set_pc(b->tag + 4 * (uint64_t) plen);   // straight-line fall-through to the next block
+    a.add(x86::r14d, imm(plen));
+  }
+  a.mov(x86::eax, x86::r14d);   // total instructions completed across the chain
+  a.bind(done);                 // bail jumps here with EAX already set
+  a.add(x86::rsp, imm(48));
+  a.pop(x86::r14);
   a.pop(x86::rsi);
   a.pop(x86::rbx);
   a.ret();

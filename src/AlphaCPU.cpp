@@ -448,6 +448,9 @@ void CAlphaCPU::init()
 		o.dram_ptr      = (uint32_t) ((char*) &dram_ptr   - (char*) this);
 		o.dram_size     = (uint32_t) ((char*) &dram_size  - (char*) this);
 		o.state_pc      = (uint32_t) ((char*) &state.pc   - (char*) this);
+		o.jit_budget    = (uint32_t) ((char*) &m_jit_budget      - (char*) this);
+		o.check_int     = (uint32_t) ((char*) &state.check_int    - (char*) this);
+		o.check_timers  = (uint32_t) ((char*) &state.check_timers - (char*) this);
 		m_jit->set_offsets(o);
 	}
 #endif
@@ -848,6 +851,7 @@ void CAlphaCPU::jit_run(int budget)
 			}
 			continue;
 #else
+			m_jit_budget = budget;   // ceiling for self-looping chains (epilogue stops at it)
 			const u32 done = b->code(this, &state.r[0]);
 			state.r[31] = 0;
 			// state.pc is written by the compiled block itself (next PC, or the bail PC).
