@@ -20,6 +20,7 @@ enum SafeOp {
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
   OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
   OP_LDA, OP_LDAH,               // load-address: Ra = Rb + disp16 (<<16 for LDAH); pure ALU
+  OP_HW_MFPR,                    // HW_MFPR (0x19), PALmode only: Ra = IPR[(ins>>8)&0xff] via helper
   OP_JMP,                        // JMP/JSR/RET (0x1a): Ra = PC+4; PC = Rb & ~3 (computed target)
   OP_CALL_PAL,                   // CALL_PAL (0x00): save R23/exc_addr; PC = pal_base | entry offset
   // Branch-format terminators (contiguous; see is_branch). Conditional on Ra, plus BR/BSR.
@@ -32,7 +33,9 @@ static inline bool is_store(SafeOp op)  { return op == OP_STQ || op == OP_STL; }
 static inline bool is_terminator(SafeOp op) { return op == OP_JMP || op == OP_CALL_PAL || is_branch(op); }
 
 // Safe = goto-free, register-only operate-format ops (no trap, memory, or branch).
-SafeOp classify(uint32_t ins)
+// pal_block enables PALmode-only ops (HW_MFPR): outside PALmode they'd OPCDEC, so only
+// compile them when the block is PALmode (the dispatcher keys blocks by PC bit 0).
+SafeOp classify(uint32_t ins, bool pal_block)
 {
   uint32_t opcode = ins >> 26;
   uint32_t func = (ins >> 5) & 0x7F;
@@ -78,6 +81,12 @@ SafeOp classify(uint32_t ins)
     }
     case 0x08: return OP_LDA;   // load address (Ra = Rb + disp16) -- pure ALU, no memory
     case 0x09: return OP_LDAH;  // load address high (Ra = Rb + (disp16 << 16))
+    case 0x19:                  // HW_MFPR: read IPR -> Ra. PALmode-only (else OPCDEC).
+      // ISUM (fn 0x0d) aggregates the live hardware interrupt requests (eir/slr/crr/pcr) that
+      // devices raise from other threads, so it changes async - the verify's interp and
+      // compiled reads of it legitimately differ. Leave only that one to the interpreter
+      if (!pal_block || ((ins >> 8) & 0xff) == 0x0d) return OP_NONE;
+      return OP_HW_MFPR;
     // NOTE: 0x1a (JMP/JSR/RET) intentionally NOT compiled. It's a terminator (can't lengthen
     // blocks), its targets vary so the single-slot link cache thrashes (no chaining), and the
     // chains are cut by CALL_PAL/MISC anyway -- compiling it measured as a net regression. The
@@ -166,7 +175,7 @@ void CJitEngine::flush()
   }
 }
 
-void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper)
+void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper)
 {
   using namespace asmjit;
   b->compiled = true;
@@ -189,7 +198,7 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
   while (plen < b->n_instr && plen < 64
          && (phys + (uint64_t) plen * 4) < page_end)
   {
-    SafeOp sop = classify(words[plen]);
+    SafeOp sop = classify(words[plen], pal_block);
     if (sop == OP_NONE) {               // uncompilable op ends the straight-line prefix
 #ifdef JIT_STATS
       const uint32_t bop = words[plen] >> 26;
@@ -246,7 +255,7 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
 
   for (uint32_t i = 0; i < plen; ++i) {
     uint32_t ins = words[i];
-    SafeOp op = classify(ins);
+    SafeOp op = classify(ins, pal_block);
     int ra = (ins >> 21) & 0x1F;
     int rb = (ins >> 16) & 0x1F;
     int rc = ins & 0x1F;
@@ -380,6 +389,23 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       if (rb == 31)  a.mov(x86::rax, imm(d));
       else        {  a.mov(x86::rax, reg(rb)); if (d) a.add(x86::rax, imm(d)); }
       a.mov(reg(ra), x86::rax);
+      continue;
+    }
+
+    // HW_MFPR (0x19, PALmode): read the IPR named by (ins>>8)&0xff into Ra. The helper is an
+    // independent reimplementation of DO_HW_MFPR that RETURNS the value (it reads state only, never
+    // writes it). pass the current Ra as `cur` so an unknown IPR returns it unchanged (matching interp),
+    // and write reg(ra) here so the value lands in whichever regs[] array we hold. Every MFPR IPR is
+    // a pure read
+    if (op == OP_HW_MFPR) {
+      if (ra != 31) {                                  // MFPR R31 discards the value (R31 is hardwired 0)
+        a.mov(x86::rcx, x86::rsi);                     // cpu
+        a.mov(x86::edx, imm(ins));                     // full instruction (helper extracts the IPR index)
+        a.mov(x86::r8, reg(ra));                       // cur: current Ra, returned as-is for an unknown IPR
+        a.mov(x86::rax, imm((uint64_t) hw_mfpr_helper));
+        a.call(x86::rax);                              // -> RAX = IPR value
+        a.mov(reg(ra), x86::rax);                      // Ra = value (reg() applies the PALshadow remap)
+      }
       continue;
     }
 

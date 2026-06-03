@@ -955,7 +955,7 @@ void CAlphaCPU::jit_run(int budget)
 			if (!nb->compiled)
 				m_jit->compile_block(nb, (const uint8_t*) dram_ptr, dram_size,
 				                     (void*) &CAlphaCPU::jit_read, (void*) &CAlphaCPU::jit_write,
-				                     (void*) &CAlphaCPU::jit_opcdec);
+				                     (void*) &CAlphaCPU::jit_opcdec, (void*) &CAlphaCPU::jit_hw_mfpr);
 		}
 	}
 }
@@ -1085,6 +1085,54 @@ void CAlphaCPU::jit_opcdec(CAlphaCPU* cpu, u64 cpc)
 	cpu->state.exc_addr = cpc;
 	cpu->set_pc(cpu->state.pal_base | OPCDEC | U64(1));
 	cpu->cSystem->cpu_clear_lock(cpu->state.iProcNum);
+}
+
+/* HW_MFPR (PALmode): return the IPR selected by (ins>>8)&0xff. */
+u64 CAlphaCPU::jit_hw_mfpr(CAlphaCPU* cpu, u32 ins, u64 cur)
+{
+	const auto& state    = cpu->state;
+	const u32   function = (ins >> 8) & 0xff;
+
+	if ((function & 0xc0) == 0x40)   // PCTX
+		return ((u64) state.asn << 39) | ((u64) state.astrr << 9) | ((u64) state.aster << 5)
+		     | (state.fpen ? U64(0x1) << 2 : 0) | (state.ppcen ? U64(0x1) << 1 : 0);
+
+	switch (function)
+	{
+	case 0x05: return state.pmpc;                            // PMPC
+	case 0x06: return state.exc_addr;                        // EXC_ADDR
+	case 0x07: return cpu->va_form(state.exc_addr, true);    // IVA_FORM
+	case 0x08: case 0x09: case 0x0a: case 0x0b:              // IER_CM / CM / IER
+		return (((u64) state.eien) << 33) | (((u64) state.slen) << 32)
+		     | (((u64) state.cren) << 31) | (((u64) state.pcen) << 29)
+		     | (((u64) state.sien) << 13) | (((u64) state.asten) << 13)
+		     | (((u64) state.cm) << 3);
+	case 0x0c: return ((u64) state.sir) << 13;               // SIRR
+	case 0x0d:                                               // ISUM -- dormant: classify gates this
+		// out of the JIT (it reads async interrupt-request lines); kept here for completeness.
+		return (((u64) (state.eir & state.eien)) << 33)
+		     | (((u64) (state.slr & state.slen)) << 32)
+		     | (((u64) (state.crr & state.cren)) << 31)
+		     | (((u64) (state.pcr & state.pcen)) << 29)
+		     | (((u64) (state.sir & state.sien)) << 13)
+		     | (((u64) (((U64(0x1) << (state.cm + 1)) - 1) & state.aster & state.astrr & (state.asten * 0x3))) << 3)
+		     | (((u64) (((U64(0x1) << (state.cm + 1)) - 1) & state.aster & state.astrr & (state.asten * 0xc))) << 7);
+	case 0x0f: return state.exc_sum;                         // EXC_SUM
+	case 0x10: return state.pal_base;                        // PAL_BASE
+	case 0x11:                                               // I_CTL
+		return state.i_ctl_other | (((u64) CPU_CHIP_ID) << 24) | (u64) state.i_ctl_vptb
+		     | (((u64) state.i_ctl_va_mode) << 15) | (state.hwe ? U64(0x1) << 12 : 0)
+		     | (state.sde ? U64(0x1) << 7 : 0) | (((u64) state.i_ctl_spe) << 3);
+	case 0x14: return state.pctr_ctl;                        // PCTR_CTL
+	case 0x16: return state.i_stat;                          // I_STAT
+	case 0x27: return state.mm_stat;                         // MM_STAT
+	case 0x2a: return state.dc_stat;                         // DC_STAT
+	case 0x2b: return 0;                                     // C_DATA
+	case 0xc0: return (((u64) state.cc_offset) << 32) | (state.cc & U64(0xffffffff));   // CC
+	case 0xc2: return state.fault_va;                        // VA
+	case 0xc3: return cpu->va_form(state.va_form_va, false); // VA_FORM
+	}
+	return cur;   // unknown IPR: DO_HW_MFPR's UNKNOWN2 leaves Ra unchanged
 }
 #endif
 
