@@ -808,12 +808,16 @@ void CAlphaCPU::jit_run(int budget)
 				const u32 ins = vw[k];
 				const u32 opc = ins >> 26;
 				const int lra = (ins >> 21) & 0x1F;
-				const bool isld = (opc == 0x28 || opc == 0x29) && lra != 31;
+				// HW_LD physical (0x1b, func 0/1) is a load too: the compiled form replays through
+				// this same vlog, but its address is physical (untranslated) with a 12-bit disp.
+				const bool is_hwld = (opc == 0x1b) && (((ins >> 12) & 0xf) <= 1);
+				const bool isld = (opc == 0x28 || opc == 0x29 || is_hwld) && lra != 31;
 				u64 eva = 0;
 				if (isld)
 				{
 					const int lrb = (ins >> 16) & 0x1F;
-					const int ldisp = (int) (int16_t) (ins & 0xFFFF);
+					const int ldisp = is_hwld ? (int) ((int32_t) (ins << 20) >> 20)   // HW_LD: 12-bit
+					                          : (int) (int16_t) (ins & 0xFFFF);        // LDx:   16-bit
 					eva = (lrb == 31 ? (u64) 0 : state.r[RREG(lrb)]) + (u64) ldisp;
 				}
 				// Stores touch memory, not GPRs, so record (addr,value) for the compiled-pass
@@ -886,6 +890,20 @@ void CAlphaCPU::jit_run(int budget)
 			}
 			if (clean)
 			{
+				// HW_MTPR verify: a compiled block writes IPR fields directly in LIVE state (its GPR
+				// writes go to jr scratch). Snapshot the writable IPR set after the interp pass
+				// (authoritative); below we compare the compiled pass's IPR writes and roll the live
+				// fields back. Pure stores -> no pre-pass reset. Keep this list in sync with jit_hw_mtpr.
+				auto cap_iprs = [&](u64* d) {
+					d[0] = state.last_tb_virt; d[1] = last_dtb_virt[0]; d[2] = last_dtb_virt[1];
+					d[3] = state.pctr_ctl; d[4] = state.dc_ctl; d[5] = (u64) state.cc_offset; d[6] = (u64) (u32) state.alt_cm;
+				};
+				auto put_iprs = [&](const u64* s) {
+					state.last_tb_virt = s[0]; last_dtb_virt[0] = s[1]; last_dtb_virt[1] = s[2];
+					state.pctr_ctl = s[3]; state.dc_ctl = s[4]; state.cc_offset = (u32) s[5]; state.alt_cm = (int) s[6];
+				};
+				u64 ipr_interp[7];
+				cap_iprs(ipr_interp);
 				u64 jr[64];   // 64: a compiled PALmode block may touch the shadow bank
 				memcpy(jr, snap, sizeof(jr));
 				const u64 interp_pc = state.pc;   // interpreter is authoritative for the PC
@@ -915,9 +933,16 @@ void CAlphaCPU::jit_run(int budget)
 						       (unsigned long long) state.r[2], (unsigned long long) jr[2],
 						       (unsigned long long) snap[5]);
 					}
+					u64 ipr_jit[7];
+					cap_iprs(ipr_jit);   // compiled pass wrote IPRs into live state; check vs interp
+					for (int ii = 0; ii < 7; ii++) if (ipr_jit[ii] != ipr_interp[ii])
+						printf("[JIT][VERIFY] IPR MISMATCH at %016llx slot %d: interp=%016llx jit=%016llx\n",
+						       (unsigned long long) start_virt, ii,
+						       (unsigned long long) ipr_interp[ii], (unsigned long long) ipr_jit[ii]);
 					m_jit->verify_compare(start_virt, state.r, jr, vw, b->prefix_len);
 				}
 				state.pc = interp_pc;   // restore; the block's PC write was only for the check
+				put_iprs(ipr_interp);   // roll back the compiled pass's live IPR writes (verify-only)
 			}
 			continue;
 #else
@@ -967,7 +992,8 @@ void CAlphaCPU::jit_run(int budget)
 			if (!nb->compiled)
 				m_jit->compile_block(nb, (const uint8_t*) dram_ptr, dram_size,
 				                     (void*) &CAlphaCPU::jit_read, (void*) &CAlphaCPU::jit_write,
-				                     (void*) &CAlphaCPU::jit_opcdec, (void*) &CAlphaCPU::jit_hw_mfpr);
+				                     (void*) &CAlphaCPU::jit_opcdec, (void*) &CAlphaCPU::jit_hw_mfpr,
+				                     (void*) &CAlphaCPU::jit_read_phys, (void*) &CAlphaCPU::jit_hw_mtpr);
 		}
 	}
 }
@@ -1025,6 +1051,32 @@ int CAlphaCPU::jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
 	// DRAM only: bail on MMIO so the interpreter does device reads (side effects + ordering).
 	if (phys >= cpu->dram_size)
 		return 1;
+	*out = dram_read(cpu->dram_ptr, phys, size_bits);
+	return 0;
+}
+
+// JIT HW_LD helper (static). Physical read of size_bits at phys -> *out with NO translation -
+// the PALmode HW_LD physical longword/quadword forms (func 0/1). Aligns like READ_PHYS_NT.
+// Verify replays the interpreter's value (race-free); MMIO bails so the interpreter does the
+// ordered device read. Returns 0 on success, 1 on a bail.
+int CAlphaCPU::jit_read_phys(CAlphaCPU* cpu, u64 phys, int size_bits, u64* out)
+{
+	if (cpu->m_jit_vreplay)
+	{
+		if (phys != cpu->m_jit_vaddr[cpu->m_jit_vlog_i])
+		{
+			static int n = 0;
+			if (n++ < 50)
+				printf("[JIT] HW_LD ADDR MISMATCH: compiled pa=%016llx interp pa=%016llx\n",
+				       (unsigned long long) phys, (unsigned long long) cpu->m_jit_vaddr[cpu->m_jit_vlog_i]);
+		}
+		*out = cpu->m_jit_vlog[cpu->m_jit_vlog_i++];
+		return 0;
+	}
+
+	phys &= ~((u64) (size_bits / 8) - 1);     // align like READ_PHYS_NT (ALIGN_PHYS)
+	if (phys >= cpu->dram_size)
+		return 1;                              // MMIO: let the interpreter do the ordered read
 	*out = dram_read(cpu->dram_ptr, phys, size_bits);
 	return 0;
 }
@@ -1141,6 +1193,23 @@ u64 CAlphaCPU::jit_hw_mfpr(CAlphaCPU* cpu, u32 ins, u64 cur)
 	case 0xc3: return cpu->va_form(state.va_form_va, false); // VA_FORM
 	}
 	return cur;   // unknown IPR: DO_HW_MFPR's UNKNOWN2 leaves Ra unchanged
+}
+
+/* HW_MTPR (PALmode): store the side-effect-free IPR selected by `function` (value = Rb). The verify
+ * pass isolates+checks these live-state writes. Mirrors DO_HW_MTPR (cpu_pal.h) verbatim; classify
+ * never compiles the side-effecting IPRs, so only these functions can reach here. */
+void CAlphaCPU::jit_hw_mtpr(CAlphaCPU* cpu, u32 function, u64 value)
+{
+	switch (function)
+	{
+	case 0x00: cpu->state.last_tb_virt = value; break;                          // ITB_TAG
+	case 0x14: cpu->state.pctr_ctl = value & U64(0xffffffffffffffdf); break;     // PCTR_CTL
+	case 0x20: cpu->last_dtb_virt[0] = value; break;                             // DTB_TAG0
+	case 0x26: cpu->state.alt_cm = (int) (value & 3); break;                     // DTB_ALTMODE
+	case 0x29: cpu->state.dc_ctl = value; break;                                 // DC_CTL
+	case 0xa0: cpu->last_dtb_virt[1] = value; break;                             // DTB_TAG1
+	case 0xc0: cpu->state.cc_offset = (u32) (value >> 32); break;                // CC
+	}
 }
 #endif
 

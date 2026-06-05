@@ -21,6 +21,8 @@ enum SafeOp {
   OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
   OP_LDA, OP_LDAH,               // load-address: Ra = Rb + disp16 (<<16 for LDAH); pure ALU
   OP_HW_MFPR,                    // HW_MFPR (0x19), PALmode only: Ra = IPR[(ins>>8)&0xff] via helper
+  OP_HW_LDL, OP_HW_LDQ,          // HW_LD (0x1b) physical func 0/1, PALmode only: Ra = phys[Rb+disp12]
+  OP_HW_MTPR,                    // HW_MTPR (0x1d) side-effect-free IPRs, PALmode only: IPR[fn] = Rb
   OP_JMP,                        // JMP/JSR/RET (0x1a): Ra = PC+4; PC = Rb & ~3 (computed target)
   OP_CALL_PAL,                   // CALL_PAL (0x00): save R23/exc_addr; PC = pal_base | entry offset
   // Branch-format terminators (contiguous; see is_branch). Conditional on Ra, plus BR/BSR.
@@ -87,6 +89,30 @@ SafeOp classify(uint32_t ins, bool pal_block)
       // compiled reads of it legitimately differ. Leave only that one to the interpreter
       if (!pal_block || ((ins >> 8) & 0xff) == 0x0d) return OP_NONE;
       return OP_HW_MFPR;
+    case 0x1b: {                // HW_LD: read phys[Rb+disp12] -> Ra. PALmode-only. Compile only the
+      // physical longword/quadword forms (func 0/1, no translation). Locked (LL/SC), VPTE, virtual,
+      // alt-mode and write-check forms all run DATA_PHYS_NT translation with side effects -> interpret.
+      if (!pal_block) return OP_NONE;
+      const uint32_t f = (ins >> 12) & 0xf;
+      if (f == 0) return OP_HW_LDL;
+      if (f == 1) return OP_HW_LDQ;
+      return OP_NONE;
+    }
+    case 0x1d: {                // HW_MTPR (PALmode): compile only the side-effect-free IPR writes.
+      // TB-fill tags, DC_CTL, DTB_ALTMODE, PCTR_CTL, CC offset are plain stores; the no-op IPRs
+      // write nothing. Everything else (TB/cache flush, interrupts, PAL_BASE, i_ctl, the 0x40-7f
+      // group) has side effects -> interpret. The verify pass snapshots+compares these IPR writes.
+      if (!pal_block) return OP_NONE;
+      switch ((ins >> 8) & 0xff) {
+        case 0x00: case 0x14: case 0x20: case 0x26:   // ITB_TAG, PCTR_CTL, DTB_TAG0, DTB_ALTMODE
+        case 0x29: case 0xa0: case 0xc0:              // DC_CTL, DTB_TAG1, CC
+          return OP_HW_MTPR;
+        case 0x15: case 0x17: case 0x27:              // CLR_MAP, SLEEP, MM_STAT (no-ops)
+        case 0x2b: case 0x2c: case 0x2d:              // C_DATA, C_SHIFT, M_FIX (no-ops)
+          return OP_NOP;
+      }
+      return OP_NONE;
+    }
     // NOTE: 0x1a (JMP/JSR/RET) intentionally NOT compiled. It's a terminator (can't lengthen
     // blocks), its targets vary so the single-slot link cache thrashes (no chaining), and the
     // chains are cut by CALL_PAL/MISC anyway -- compiling it measured as a net regression. The
@@ -209,7 +235,7 @@ void CJitEngine::flush_non_global()
   }
 }
 
-void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper)
+void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper)
 {
   using namespace asmjit;
   b->compiled = true;
@@ -238,8 +264,12 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       m_term_op[bop]++;                 // tally what cut this block (the coverage gap to chase)
       if (bop == 0x00)                  // CALL_PAL: also tally the function code (low 8 bits)
         m_pal_func[words[plen] & 0xFF]++;
-      // Punch list: one-shot print of the first ACTIONABLE breaker
-      if (!m_first_breaker_logged && bop != 0x1a && bop != 0x00) {
+      // Punch list: one-shot print of the first ACTIONABLE breaker -- skip the opcodes whose
+      // compilable subset is already settled, so it points at the next NEW target rather than a
+      // decided one: 0x1a JMP (declined), 0x00 CALL_PAL (terminator), 0x1b HW_LD (physical done;
+      // virtual forms side-effecting), 0x1d HW_MTPR (pure-store IPRs done; rest side-effecting).
+      // The per-opcode breaker counts in the stats table below still include all of these.
+      if (!m_first_breaker_logged && bop != 0x1a && bop != 0x00 && bop != 0x1b && bop != 0x1d) {
         m_first_breaker_logged = true;
         printf("[JIT][PUNCH] first unhandled breaker: %s(0x%02x) ins=%08x at pc=%016llx%s\n",
                opcode_name(bop), bop, words[plen],
@@ -414,6 +444,47 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       a.add(x86::eax, x86::r14d);                                      // + earlier chained iterations
       a.jmp(done);
       a.bind(ok);
+      continue;
+    }
+
+    // HW_LD physical (PALmode func 0/1): Ra = phys[Rb + disp12], no translation. jit_read_phys
+    // does the aligned DRAM read (or replays in verify, bails on MMIO so the interpreter does the
+    // ordered device read). disp is 12-bit here, not the 16-bit memory-format displacement.
+    if (op == OP_HW_LDL || op == OP_HW_LDQ) {
+      if (ra == 31) continue;                                  // R31 dest discards the read
+      const int disp = (int) ((int32_t) (ins << 20) >> 20);    // sign-extend 12-bit displacement
+      const int size_bits = (op == OP_HW_LDQ) ? 64 : 32;
+      if (rb == 31)  a.mov(x86::rdx, imm(disp));               // phys addr -> RDX
+      else        {  a.mov(x86::rdx, reg(rb)); if (disp) a.add(x86::rdx, imm(disp)); }
+      a.mov(x86::rcx, x86::rsi);                               // cpu
+      a.mov(x86::r8d, imm(size_bits));                         // size in bits
+      a.lea(x86::r9, x86::qword_ptr(x86::rsp, 32));            // &out slot
+      a.mov(x86::rax, imm((uint64_t) hw_ld_helper));
+      a.call(x86::rax);                                        // jit_read_phys(cpu, phys, size, &out)
+      Label ok = a.new_label();
+      a.test(x86::eax, x86::eax);
+      a.jz(ok);
+      set_pc(b->tag + 4 * (uint64_t) i);                       // resume at the faulting HW_LD
+      a.mov(x86::eax, imm(i));                                  // this iteration: i instrs done
+      a.add(x86::eax, x86::r14d);                               // + earlier chained iterations
+      a.jmp(done);
+      a.bind(ok);
+      if (op == OP_HW_LDQ) a.mov(x86::rax, x86::qword_ptr(x86::rsp, 32));
+      else                 a.movsxd(x86::rax, x86::dword_ptr(x86::rsp, 32));
+      a.mov(reg(ra), x86::rax);
+      continue;
+    }
+
+    // HW_MTPR (PALmode, side-effect-free IPRs): jit_hw_mtpr(cpu, function, value=Rb) stores an IPR
+    // field directly. The verify pass snapshots+compares those live-state writes. No fault/bail.
+    if (op == OP_HW_MTPR) {
+      const uint32_t function = (ins >> 8) & 0xff;
+      a.mov(x86::rcx, x86::rsi);                               // cpu
+      a.mov(x86::edx, imm(function));                          // IPR function number
+      if (rb == 31)  a.xor_(x86::r8d, x86::r8d);               // value -> R8 (R31 == 0)
+      else           a.mov(x86::r8, reg(rb));
+      a.mov(x86::rax, imm((uint64_t) hw_mtpr_helper));
+      a.call(x86::rax);                                        // jit_hw_mtpr(cpu, function, value)
       continue;
     }
 
