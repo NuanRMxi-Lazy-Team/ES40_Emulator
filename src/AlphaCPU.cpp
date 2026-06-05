@@ -821,13 +821,16 @@ void CAlphaCPU::jit_run(int budget)
 					eva = (lrb == 31 ? (u64) 0 : state.r[RREG(lrb)]) + (u64) ldisp;
 				}
 				// Stores touch memory, not GPRs, so record (addr,value) for the compiled-pass
-				// compare. Ra (lra) is the value source; Rb is the base.
-				const bool isst = (opc == 0x2c || opc == 0x2d);
+				// compare. Ra (lra) is the value source; Rb is the base. HW_ST physical (0x1f func
+				// 0/1) stores too, with a physical (untranslated) address and a 12-bit disp.
+				const bool is_hwst = (opc == 0x1f) && (((ins >> 12) & 0xf) <= 1);
+				const bool isst = (opc == 0x2c || opc == 0x2d || is_hwst);
 				u64 sva = 0, sval = 0;
 				if (isst)
 				{
 					const int srb = (ins >> 16) & 0x1F;
-					const int sdisp = (int) (int16_t) (ins & 0xFFFF);
+					const int sdisp = is_hwst ? (int) ((int32_t) (ins << 20) >> 20)   // HW_ST: 12-bit
+					                          : (int) (int16_t) (ins & 0xFFFF);        // STx:   16-bit
 					sva  = (srb == 31 ? (u64) 0 : state.r[RREG(srb)]) + (u64) sdisp;
 					sval = (lra == 31 ? (u64) 0 : state.r[RREG(lra)]);
 				}
@@ -993,7 +996,8 @@ void CAlphaCPU::jit_run(int budget)
 				m_jit->compile_block(nb, (const uint8_t*) dram_ptr, dram_size,
 				                     (void*) &CAlphaCPU::jit_read, (void*) &CAlphaCPU::jit_write,
 				                     (void*) &CAlphaCPU::jit_opcdec, (void*) &CAlphaCPU::jit_hw_mfpr,
-				                     (void*) &CAlphaCPU::jit_read_phys, (void*) &CAlphaCPU::jit_hw_mtpr);
+				                     (void*) &CAlphaCPU::jit_read_phys, (void*) &CAlphaCPU::jit_hw_mtpr,
+				                     (void*) &CAlphaCPU::jit_write_phys);
 		}
 	}
 }
@@ -1134,6 +1138,33 @@ int CAlphaCPU::jit_write(CAlphaCPU* cpu, u64 va, int size_bits, u64 value)
 		dram_write(cpu->dram_ptr, phys, size_bits, value);
 	else
 		cpu->cSystem->WriteMem(phys, size_bits, value, cpu);
+	return 0;
+}
+
+// JIT HW_ST helper (static). Physical write of size_bits = value at phys with NO translation -
+// the PALmode HW_ST physical longword/quadword forms (func 0/1). Aligns like WRITE_PHYS_NT.
+// Verify compares against the interpreter's recorded store (stores change memory, not GPRs);
+// MMIO bails so the interpreter does the ordered device write. Returns 0 on success, 1 on a bail.
+int CAlphaCPU::jit_write_phys(CAlphaCPU* cpu, u64 phys, int size_bits, u64 value)
+{
+	if (cpu->m_jit_vreplay)
+	{
+		const u32 i = cpu->m_jit_slog_i++;
+		if (phys != cpu->m_jit_slog_addr[i] || value != cpu->m_jit_slog_val[i])
+		{
+			static int n = 0;
+			if (n++ < 50)
+				printf("[JIT] HW_ST STORE MISMATCH: compiled pa=%016llx val=%016llx  interp pa=%016llx val=%016llx\n",
+				       (unsigned long long) phys, (unsigned long long) value,
+				       (unsigned long long) cpu->m_jit_slog_addr[i], (unsigned long long) cpu->m_jit_slog_val[i]);
+		}
+		return 0;
+	}
+
+	phys &= ~((u64) (size_bits / 8) - 1);     // align like WRITE_PHYS_NT (ALIGN_PHYS)
+	if (phys >= cpu->dram_size)
+		return 1;                              // MMIO: let the interpreter do the ordered write
+	dram_write(cpu->dram_ptr, phys, size_bits, value);
 	return 0;
 }
 

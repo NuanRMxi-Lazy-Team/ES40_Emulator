@@ -23,6 +23,7 @@ enum SafeOp {
   OP_HW_MFPR,                    // HW_MFPR (0x19), PALmode only: Ra = IPR[(ins>>8)&0xff] via helper
   OP_HW_LDL, OP_HW_LDQ,          // HW_LD (0x1b) physical func 0/1, PALmode only: Ra = phys[Rb+disp12]
   OP_HW_MTPR,                    // HW_MTPR (0x1d) side-effect-free IPRs, PALmode only: IPR[fn] = Rb
+  OP_HW_STL, OP_HW_STQ,          // HW_ST (0x1f) physical func 0/1, PALmode only: phys[Rb+disp12] = Ra
   OP_JMP,                        // JMP/JSR/RET (0x1a): Ra = PC+4; PC = Rb & ~3 (computed target)
   OP_CALL_PAL,                   // CALL_PAL (0x00): save R23/exc_addr; PC = pal_base | entry offset
   // Branch-format terminators (contiguous; see is_branch). Conditional on Ra, plus BR/BSR.
@@ -111,6 +112,15 @@ SafeOp classify(uint32_t ins, bool pal_block)
         case 0x2b: case 0x2c: case 0x2d:              // C_DATA, C_SHIFT, M_FIX (no-ops)
           return OP_NOP;
       }
+      return OP_NONE;
+    }
+    case 0x1f: {                // HW_ST (PALmode): compile physical longword/quadword (func 0/1).
+      // Store-conditional (2/3) does LL/SC, virtual (4/5) and virtual-alt (12/13) translate with
+      // side effects -> interpret. Mirrors HW_LD; the value is Ra, base Rb, displacement 12-bit.
+      if (!pal_block) return OP_NONE;
+      const uint32_t f = (ins >> 12) & 0xf;
+      if (f == 0) return OP_HW_STL;
+      if (f == 1) return OP_HW_STQ;
       return OP_NONE;
     }
     // NOTE: 0x1a (JMP/JSR/RET) intentionally NOT compiled. It's a terminator (can't lengthen
@@ -235,7 +245,7 @@ void CJitEngine::flush_non_global()
   }
 }
 
-void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper)
+void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper, void* hw_st_helper)
 {
   using namespace asmjit;
   b->compiled = true;
@@ -266,10 +276,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
         m_pal_func[words[plen] & 0xFF]++;
       // Punch list: one-shot print of the first ACTIONABLE breaker -- skip the opcodes whose
       // compilable subset is already settled, so it points at the next NEW target rather than a
-      // decided one: 0x1a JMP (declined), 0x00 CALL_PAL (terminator), 0x1b HW_LD (physical done;
-      // virtual forms side-effecting), 0x1d HW_MTPR (pure-store IPRs done; rest side-effecting).
-      // The per-opcode breaker counts in the stats table below still include all of these.
-      if (!m_first_breaker_logged && bop != 0x1a && bop != 0x00 && bop != 0x1b && bop != 0x1d) {
+      // decided one: 0x1a JMP (declined), 0x00 CALL_PAL (terminator), 0x1b HW_LD / 0x1f HW_ST
+      // (physical done; conditional/virtual forms side-effecting), 0x1d HW_MTPR (pure-store IPRs
+      // done; rest side-effecting). The stats table below still counts all of these per opcode.
+      if (!m_first_breaker_logged && bop != 0x1a && bop != 0x00 && bop != 0x1b && bop != 0x1d && bop != 0x1f) {
         m_first_breaker_logged = true;
         printf("[JIT][PUNCH] first unhandled breaker: %s(0x%02x) ins=%08x at pc=%016llx%s\n",
                opcode_name(bop), bop, words[plen],
@@ -485,6 +495,31 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       else           a.mov(x86::r8, reg(rb));
       a.mov(x86::rax, imm((uint64_t) hw_mtpr_helper));
       a.call(x86::rax);                                        // jit_hw_mtpr(cpu, function, value)
+      continue;
+    }
+
+    // HW_ST physical (PALmode func 0/1): phys[Rb + disp12] = Ra, no translation. jit_write_phys
+    // does the aligned DRAM write (or compares the logged store in verify, bails on MMIO). disp is
+    // 12-bit here, not the 16-bit memory-format displacement.
+    if (op == OP_HW_STL || op == OP_HW_STQ) {
+      const int disp = (int) ((int32_t) (ins << 20) >> 20);    // sign-extend 12-bit displacement
+      const int size_bits = (op == OP_HW_STQ) ? 64 : 32;
+      if (rb == 31)  a.mov(x86::rdx, imm(disp));               // phys addr -> RDX
+      else        {  a.mov(x86::rdx, reg(rb)); if (disp) a.add(x86::rdx, imm(disp)); }
+      if (ra == 31)  a.xor_(x86::r9d, x86::r9d);               // value -> R9 (R31 == 0)
+      else           a.mov(x86::r9, reg(ra));
+      a.mov(x86::rcx, x86::rsi);                               // cpu
+      a.mov(x86::r8d, imm(size_bits));                         // size in bits
+      a.mov(x86::rax, imm((uint64_t) hw_st_helper));
+      a.call(x86::rax);                                        // jit_write_phys(cpu, phys, size, value)
+      Label ok = a.new_label();
+      a.test(x86::eax, x86::eax);
+      a.jz(ok);
+      set_pc(b->tag + 4 * (uint64_t) i);                       // resume at the faulting HW_ST
+      a.mov(x86::eax, imm(i));
+      a.add(x86::eax, x86::r14d);
+      a.jmp(done);
+      a.bind(ok);
       continue;
     }
 
