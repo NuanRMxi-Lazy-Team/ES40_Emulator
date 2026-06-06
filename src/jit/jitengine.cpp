@@ -21,6 +21,7 @@ enum SafeOp {
   OP_NOP, OP_MFENCE,             // MISC (0x18): prefetch/cache hints (no-op), barriers (mfence)
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
   OP_LDBU, OP_LDWU,              // BWX byte/word loads (0x0a/0x0c): Ra = zero-extend MEM[Rb+disp16].{b,w}
+  OP_LDL_L, OP_LDQ_L,            // load-locked (0x2a/0x2b): Ra = MEM[Rb+disp16] + establish LL/SC monitor
   OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
   OP_STB, OP_STW,                // BWX byte/word stores (0x0e/0x0d): MEM[Rb + disp16].{b,w} = Ra
   OP_LDA, OP_LDAH,               // load-address: Ra = Rb + disp16 (<<16 for LDAH); pure ALU
@@ -147,6 +148,11 @@ SafeOp classify(uint32_t ins, bool pal_block)
     case 0x29: return OP_LDQ;
     case 0x0a: return OP_LDBU;  // BWX byte/word loads (Ra = zero-extend MEM[Rb+disp16].{b,w})
     case 0x0c: return OP_LDWU;
+    case 0x2a:                  // LDL_L / LDQ_L: the load-locked half of LL/SC. Compile the value-
+    case 0x2b:                  // returning forms only -- Ra==31 (lock without consuming the value)
+      // leaves the loaded value out of the GPRs, so the verify can't replay it; interpret those.
+      if (((ins >> 21) & 0x1f) == 31) return OP_NONE;
+      return (opcode == 0x2a) ? OP_LDL_L : OP_LDQ_L;
     case 0x2c: return OP_STL;   // memory-format stores (MEM[Rb+disp16] = Ra)
     case 0x2d: return OP_STQ;
     case 0x0e: return OP_STB;   // BWX byte/word stores (MEM[Rb+disp16].{b,w} = Ra low bits)
@@ -277,7 +283,7 @@ static const bool g_zapnot_init = [] {
   return true;
 }();
 
-void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper, void* hw_st_helper, void* indirect_helper)
+void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper, void* hw_st_helper, void* indirect_helper, void* read_locked_helper)
 {
   using namespace asmjit;
   b->compiled = true;
@@ -517,6 +523,31 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       a.bind(ok);
       if (op == OP_HW_LDQ) a.mov(x86::rax, x86::qword_ptr(x86::rsp, 32));
       else                 a.movsxd(x86::rax, x86::dword_ptr(x86::rsp, 32));
+      a.mov(reg(ra), x86::rax);
+      continue;
+    }
+
+    // Load-locked LDL_L/LDQ_L (0x2a/0x2b): Ra = MEM[Rb + disp16] AND establish the LL/SC exclusive
+    // monitor. 
+    if (op == OP_LDL_L || op == OP_LDQ_L) {
+      const int disp = (int) (int16_t) (ins & 0xFFFF);
+      const int size_bits = (op == OP_LDQ_L) ? 64 : 32;
+      if (rb == 31)  a.mov(x86::rdx, imm(disp));               // va -> RDX
+      else        {  a.mov(x86::rdx, reg(rb)); if (disp) a.add(x86::rdx, imm(disp)); }
+      a.mov(x86::rcx, x86::rsi);                               // cpu
+      a.mov(x86::r8d, imm(size_bits));                         // size in bits
+      a.lea(x86::r9, x86::qword_ptr(x86::rsp, 32));            // &out slot
+      a.mov(x86::rax, imm((uint64_t) read_locked_helper));
+      a.call(x86::rax);                                        // jit_read_locked(cpu, va, size, &out)
+      Label ok = a.new_label();
+      a.test(x86::eax, x86::eax);
+      a.jz(ok);
+      set_pc(b->tag + 4 * (uint64_t) i);                       // resume at the faulting LDx_L
+      a.mov(x86::eax, imm(i));
+      a.add(x86::eax, x86::r14d);
+      a.jmp(done);
+      a.bind(ok);
+      a.mov(x86::rax, x86::qword_ptr(x86::rsp, 32));           // *out already sign-extended by the helper
       a.mov(reg(ra), x86::rax);
       continue;
     }

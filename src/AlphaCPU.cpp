@@ -811,7 +811,8 @@ void CAlphaCPU::jit_run(int budget)
 				// HW_LD physical (0x1b, func 0/1) is a load too: the compiled form replays through
 				// this same vlog, but its address is physical (untranslated) with a 12-bit disp.
 				const bool is_hwld = (opc == 0x1b) && (((ins >> 12) & 0xf) <= 1);
-				const bool isld = (opc == 0x28 || opc == 0x29 || opc == 0x0a || opc == 0x0c || is_hwld) && lra != 31;  // +LDBU/LDWU
+				const bool isld = (opc == 0x28 || opc == 0x29 || opc == 0x0a || opc == 0x0c
+				                   || opc == 0x2a || opc == 0x2b || is_hwld) && lra != 31;  // +LDBU/LDWU +LDL_L/LDQ_L
 				u64 eva = 0;
 				if (isld)
 				{
@@ -998,7 +999,8 @@ void CAlphaCPU::jit_run(int budget)
 				                     (void*) &CAlphaCPU::jit_read, (void*) &CAlphaCPU::jit_write,
 				                     (void*) &CAlphaCPU::jit_opcdec, (void*) &CAlphaCPU::jit_hw_mfpr,
 				                     (void*) &CAlphaCPU::jit_read_phys, (void*) &CAlphaCPU::jit_hw_mtpr,
-				                     (void*) &CAlphaCPU::jit_write_phys, (void*) &CAlphaCPU::jit_indirect);
+				                     (void*) &CAlphaCPU::jit_write_phys, (void*) &CAlphaCPU::jit_indirect,
+				                     (void*) &CAlphaCPU::jit_read_locked);
 		}
 	}
 }
@@ -1062,6 +1064,61 @@ int CAlphaCPU::jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
 	}
 
 	*out = dram_read(cpu->dram_ptr, phys, size_bits);
+	return 0;
+}
+
+// JIT load-locked helper (static). LDx_L: the verify-checked load PLUS cpu_lock -- the LL/SC
+// exclusive monitor. cpu_lock is per-CPU + atomic + idempotent.
+int CAlphaCPU::jit_read_locked(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
+{
+	const u64 amask = (u64) (size_bits / 8) - 1;
+	if (va & amask) return 1;                 // unaligned: let the interpreter handle it
+
+	u64 phys;
+	const u64 vp = va & ~U64(0x1FFF);
+	SDataPageCache& dpc = cpu->data_page_cache[0][dpc_index(va)];
+	if (dpc.valid && dpc.virt_page == vp && dpc.cm == cpu->state.cm && dpc.asn == cpu->state.asn0)
+	{
+		phys = dpc.phys_base | (va & U64(0x1FFF));
+	}
+	else
+	{
+		const int i = cpu->FindTBEntry(va, ACCESS_READ);
+		if (i < 0) return 1;                                                  // TB miss
+		const auto& e = cpu->state.tb[TB_INDEX_DATA][i];
+		if (!e.access[0][cpu->state.cm]) return 1;                            // protection (ACV)
+		if (e.fault[0]) return 1;                                             // fault-on-read (FOR)
+		phys = e.phys | (va & e.keep_mask);
+		dpc.virt_page = vp;
+		dpc.phys_base = phys & ~U64(0x1FFF);
+		dpc.cm  = cpu->state.cm;
+		dpc.asn = cpu->state.asn0;
+		dpc.valid = true;
+	}
+
+	if (phys >= cpu->dram_size)                // MMIO: interpreter handles the I/O-space locked path
+		return 1;
+
+	if (cpu->m_jit_vreplay)
+	{
+		if (va != cpu->m_jit_vaddr[cpu->m_jit_vlog_i])
+		{
+			static int n = 0;
+			if (n++ < 50)
+				printf("[JIT] LDx_L ADDR MISMATCH: compiled va=%016llx interp va=%016llx\n",
+				       (unsigned long long) va, (unsigned long long) cpu->m_jit_vaddr[cpu->m_jit_vlog_i]);
+		}
+		*out = cpu->m_jit_vlog[cpu->m_jit_vlog_i++];   // the interp pass's (already sign-extended) value
+	}
+	else
+	{
+		const u64 raw = dram_read(cpu->dram_ptr, phys, size_bits);
+		*out = (size_bits == 32) ? sext_u64_32(raw) : raw;   // LDL_L sign-extends; LDQ_L is the full quad
+	}
+
+	// Establish the LL exclusive monitor (DO_LDx_L's READ_VIRT_LOCK_F makes the same cpu_lock call):
+	// per-CPU address/value + an atomic flag bit. The matching STx_C value-compares against it.
+	cpu->cSystem->cpu_lock(cpu->state.iProcNum, phys, *out);
 	return 0;
 }
 
