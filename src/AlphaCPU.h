@@ -508,6 +508,8 @@ private:
   static u64 jit_hw_mfpr(CAlphaCPU* cpu, u32 ins, u64 cur);
   // HW_MTPR (PALmode): store value (Rb) to the side-effect-free IPR named by function.
   static void jit_hw_mtpr(CAlphaCPU* cpu, u32 function, u64 value);
+  // Indirect jump (JMP/HW_RET): look up the target block; return its chained re-entry or null.
+  static void* jit_indirect(CAlphaCPU* cpu, u64 target);
   // Verify support: the interpreter pass records each value it loads, and the
   // compiled pass replays them instead of re-reading memory - false mismatch fix
   bool m_jit_vreplay = false;  // compiled pass: replay recorded loads, don't re-read

@@ -837,10 +837,11 @@ void CAlphaCPU::jit_run(int budget)
 				// Computed jump (JMP/JSR/RET): target = Rb & ~3, taken before execute() (the
 				// jump's target uses the old Rb, even if Ra==Rb gets the return address after).
 				u64 jtgt = 0;
-				if (opc == 0x1a)
+				if (opc == 0x1a || opc == 0x1e)   // JMP/JSR/RET (Rb & ~3) or HW_RET/HWREI (Rb & ~2)
 				{
 					const int jrb = (ins >> 16) & 0x1F;
-					jtgt = (jrb == 31 ? (u64) 0 : state.r[RREG(jrb)]) & ~U64(3);
+					const u64 jmask = (opc == 0x1e) ? ~U64(2) : ~U64(3);
+					jtgt = (jrb == 31 ? (u64) 0 : state.r[RREG(jrb)]) & jmask;
 				}
 				execute();
 				--budget;
@@ -862,9 +863,9 @@ void CAlphaCPU::jit_run(int budget)
 						const u64 tgt = vpc + (u64) (bdisp * 4);   // vpc == branch_pc + 4 (fall-through)
 						ok_branch = (state.pc == tgt);
 					}
-					else if (k == b->prefix_len - 1 && opc == 0x1a)
+					else if (k == b->prefix_len - 1 && (opc == 0x1a || opc == 0x1e))
 					{
-						ok_branch = (state.pc == jtgt);   // computed jump reached its register target
+						ok_branch = (state.pc == jtgt);   // computed jump (JMP/HW_RET) reached its register target
 					}
 					else if (k == b->prefix_len - 1 && opc == 0x00)
 					{
@@ -997,7 +998,7 @@ void CAlphaCPU::jit_run(int budget)
 				                     (void*) &CAlphaCPU::jit_read, (void*) &CAlphaCPU::jit_write,
 				                     (void*) &CAlphaCPU::jit_opcdec, (void*) &CAlphaCPU::jit_hw_mfpr,
 				                     (void*) &CAlphaCPU::jit_read_phys, (void*) &CAlphaCPU::jit_hw_mtpr,
-				                     (void*) &CAlphaCPU::jit_write_phys);
+				                     (void*) &CAlphaCPU::jit_write_phys, (void*) &CAlphaCPU::jit_indirect);
 		}
 	}
 }
@@ -1250,6 +1251,19 @@ void CAlphaCPU::jit_hw_mtpr(CAlphaCPU* cpu, u32 function, u64 value)
 	case 0xa0: cpu->last_dtb_virt[1] = value; break;                             // DTB_TAG1
 	case 0xc0: cpu->state.cc_offset = (u32) (value >> 32); break;                // CC
 	}
+}
+
+// JIT indirect-jump chaining helper (static). For a compiled JMP/HW_RET, look up the block at the
+// runtime target in this CPU's block cache (the dispatcher's own lookup -- validates valid + tag +
+// asn/asm_global) and return its chained re-entry point if it's compiled and runnable in the current
+// context; else null, so the compiled jump bails to the dispatcher. Keying on the actual target lets
+// any number of distinct targets chain without the old single-slot link thrashing on varying jumps.
+void* CAlphaCPU::jit_indirect(CAlphaCPU* cpu, u64 target)
+{
+	CJitEngine::JitBlock* b = cpu->m_jit->lookup(target, (u32) cpu->state.asn);
+	if (!b || !b->jit_body) return nullptr;
+	if ((target & 1) && !cpu->state.sde) return nullptr;   // PALmode target: shadow remap assumes SDE
+	return b->jit_body;
 }
 #endif
 

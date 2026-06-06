@@ -29,6 +29,7 @@ enum SafeOp {
   OP_HW_MTPR,                    // HW_MTPR (0x1d) side-effect-free IPRs, PALmode only: IPR[fn] = Rb
   OP_HW_STL, OP_HW_STQ,          // HW_ST (0x1f) physical func 0/1, PALmode only: phys[Rb+disp12] = Ra
   OP_JMP,                        // JMP/JSR/RET (0x1a): Ra = PC+4; PC = Rb & ~3 (computed target)
+  OP_HW_RET,                     // HW_RET (0x1e), PALmode: PC = Rb & ~2 (computed jump, the PAL return)
   OP_CALL_PAL,                   // CALL_PAL (0x00): save R23/exc_addr; PC = pal_base | entry offset
   // Branch-format terminators (contiguous; see is_branch). Conditional on Ra, plus BR/BSR.
   OP_BEQ, OP_BNE, OP_BLT, OP_BLE, OP_BGT, OP_BGE, OP_BLBC, OP_BLBS, OP_BR, OP_BSR
@@ -37,7 +38,7 @@ enum SafeOp {
 static inline bool is_branch(SafeOp op) { return op >= OP_BEQ && op <= OP_BSR; }
 static inline bool is_store(SafeOp op)  { return op == OP_STQ || op == OP_STL; }
 // A terminator ends the block and writes its own next PC (branches + the computed jump).
-static inline bool is_terminator(SafeOp op) { return op == OP_JMP || op == OP_CALL_PAL || is_branch(op); }
+static inline bool is_terminator(SafeOp op) { return op == OP_JMP || op == OP_HW_RET || op == OP_CALL_PAL || is_branch(op); }
 
 // Safe = goto-free, register-only operate-format ops (no trap, memory, or branch).
 // pal_block enables PALmode-only ops (HW_MFPR): outside PALmode they'd OPCDEC, so only
@@ -137,10 +138,11 @@ SafeOp classify(uint32_t ins, bool pal_block)
       if (f == 1) return OP_HW_STQ;
       return OP_NONE;
     }
-    // NOTE: 0x1a (JMP/JSR/RET) intentionally NOT compiled. It's a terminator (can't lengthen
-    // blocks), its targets vary so the single-slot link cache thrashes (no chaining), and the
-    // chains are cut by CALL_PAL/MISC anyway -- compiling it measured as a net regression. The
-    // OP_JMP codegen/verify paths below stay dormant; revisit once per-dispatch overhead drops.
+    case 0x1a: return OP_JMP;   // JMP/JSR/RET: computed jump (target = Rb & ~3). Now compiled --
+                                // chained in-frame via a block-cache lookup (jit_indirect), which
+                                // handles varying targets without the old single-slot thrash.
+    case 0x1e:                  // HW_RET (HWREI): a PAL return, also a simple computed jump (Rb & ~2).
+      return pal_block ? OP_HW_RET : OP_NONE;
     case 0x28: return OP_LDL;   // memory-format loads (Ra = MEM[Rb+disp16])
     case 0x29: return OP_LDQ;
     case 0x0a: return OP_LDBU;  // BWX byte/word loads (Ra = zero-extend MEM[Rb+disp16].{b,w})
@@ -275,7 +277,7 @@ static const bool g_zapnot_init = [] {
   return true;
 }();
 
-void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper, void* hw_st_helper)
+void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper, void* hw_st_helper, void* indirect_helper)
 {
   using namespace asmjit;
   b->compiled = true;
@@ -306,10 +308,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
         m_pal_func[words[plen] & 0xFF]++;
       // Punch list: one-shot print of the first ACTIONABLE breaker -- skip the opcodes whose
       // compilable subset is already settled, so it points at the next NEW target rather than a
-      // decided one: 0x1a JMP (declined), 0x00 CALL_PAL (terminator), 0x1b HW_LD / 0x1f HW_ST
-      // (physical done; conditional/virtual forms side-effecting), 0x1d HW_MTPR (pure-store IPRs
-      // done; rest side-effecting). The stats table below still counts all of these per opcode.
-      if (!m_first_breaker_logged && bop != 0x1a && bop != 0x00 && bop != 0x1b && bop != 0x1d && bop != 0x1f) {
+      // decided one: 0x00 CALL_PAL (terminator), 0x1b HW_LD / 0x1f HW_ST (physical done;
+      // conditional/virtual forms side-effecting), 0x1d HW_MTPR (pure-store IPRs done; rest
+      // side-effecting). JMP (0x1a) + HW_RET (0x1e) are now compiled+chained. Stats count all.
+      if (!m_first_breaker_logged && bop != 0x00 && bop != 0x1b && bop != 0x1d && bop != 0x1f) {
         m_first_breaker_logged = true;
         printf("[JIT][PUNCH] first unhandled breaker: %s(0x%02x) ins=%08x at pc=%016llx%s\n",
                opcode_name(bop), bop, words[plen],
@@ -322,7 +324,7 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     plen++;
     if (is_terminator(sop)) {           // branch or computed jump ends the block
       terminator_branch = true;
-      if (sop == OP_JMP) terminator_jmp = true;
+      if (sop == OP_JMP || sop == OP_HW_RET) terminator_jmp = true;
       break;
     }
   }
@@ -599,6 +601,16 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       continue;
     }
 
+    // HW_RET (HWREI, 0x1e): a PAL return -- a simple computed jump, target = Rb & ~2, no return-
+    // address write. Like OP_JMP, leaves R10 = target for the epilogue's in-frame chain.
+    if (op == OP_HW_RET) {
+      if (rb == 31) a.xor_(x86::r10d, x86::r10d);
+      else          a.mov(x86::r10, reg(rb));
+      a.and_(x86::r10, imm(~(uint64_t) 2));                       // target = Rb & ~2 (clear bit 1)
+      a.mov(x86::qword_ptr(x86::rsi, m_off.state_pc), x86::r10);  // state.pc = target
+      continue;
+    }
+
     // CALL_PAL (0x00): vector to the PALcode entry, saving the return address in R23 and the
     // faulting PC in EXC_ADDR (per ENTER_NATIVE_CALL_PAL). 
     if (op == OP_CALL_PAL) {
@@ -837,11 +849,22 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
   };
 #endif
   if (terminator_jmp) {
-    // Computed jump: the JMP codegen already wrote state.pc to the (register) target. Don't
-    // chain it -- targets vary (returns/dispatch), so the single-slot cache thrashes, costing
-    // more than the dispatcher round-trip it would save (measured regression). Just count the
-    // block and return; the dispatcher resolves the target (and may run a fresh chain there).
+    // Computed jump (JMP / HW_RET): R10 holds the register target (already written to state.pc).
+    // Chain in-frame via jit_indirect -- the dispatcher's own block-cache lookup -- tailing into
+    // the target's compiled body when it's live + runnable here. Unlike the old single-slot link
+    // this keys on the ACTUAL target, so it handles all targets with no thrash on varying jumps.
     a.add(x86::r14d, imm(plen));
+#ifndef JIT_VERIFY
+    Label exit_chain = a.new_label();
+    emit_gate(exit_chain);                                        // budget/interrupt: bail to dispatcher
+    a.mov(x86::rcx, x86::rsi);                                    // cpu
+    a.mov(x86::rdx, x86::r10);                                    // target PC (== state.pc)
+    a.mov(x86::rax, imm((uint64_t) indirect_helper));
+    a.call(x86::rax);                                             // jit_indirect(cpu, target) -> body | 0
+    a.test(x86::rax, x86::rax);                              a.jz(exit_chain);
+    a.jmp(x86::rax);                                              // HIT: tail into the target's body
+    a.bind(exit_chain);
+#endif
   } else if (terminator_branch) {
     a.add(x86::r14d, imm(plen));   // R10 still holds the next PC (branch wrote state.pc + R10)
 #ifndef JIT_VERIFY
