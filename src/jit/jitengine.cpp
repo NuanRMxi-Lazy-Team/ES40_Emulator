@@ -20,6 +20,7 @@ enum SafeOp {
   OP_NOP, OP_MFENCE,             // MISC (0x18): prefetch/cache hints (no-op), barriers (mfence)
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
   OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
+  OP_STB, OP_STW,                // BWX byte/word stores (0x0e/0x0d): MEM[Rb + disp16].{b,w} = Ra
   OP_LDA, OP_LDAH,               // load-address: Ra = Rb + disp16 (<<16 for LDAH); pure ALU
   OP_HW_MFPR,                    // HW_MFPR (0x19), PALmode only: Ra = IPR[(ins>>8)&0xff] via helper
   OP_HW_LDL, OP_HW_LDQ,          // HW_LD (0x1b) physical func 0/1, PALmode only: Ra = phys[Rb+disp12]
@@ -135,6 +136,8 @@ SafeOp classify(uint32_t ins, bool pal_block)
     case 0x29: return OP_LDQ;
     case 0x2c: return OP_STL;   // memory-format stores (MEM[Rb+disp16] = Ra)
     case 0x2d: return OP_STQ;
+    case 0x0e: return OP_STB;   // BWX byte/word stores (MEM[Rb+disp16].{b,w} = Ra low bits)
+    case 0x0d: return OP_STW;
     // Branch format: opcode | Ra | disp21. Conditional on Ra, plus BR/BSR.
     case 0x30: return OP_BR;    case 0x34: return OP_BSR;
     case 0x38: return OP_BLBC;  case 0x39: return OP_BEQ;
@@ -439,9 +442,9 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     // value): in verify it compares against the interpreter's recorded store (stores touch
     // memory, not GPRs), in production it writes (side-effect-free cache translation, bail
     // on miss). On a fault, bail like a load. (Inline write fast path is a follow-up.)
-    if (op == OP_STL || op == OP_STQ) {
+    if (op == OP_STL || op == OP_STQ || op == OP_STB || op == OP_STW) {
       const int disp = (int) (int16_t) (ins & 0xFFFF);
-      const int size_bits = (op == OP_STQ) ? 64 : 32;
+      const int size_bits = (op == OP_STQ) ? 64 : (op == OP_STL) ? 32 : (op == OP_STW) ? 16 : 8;
       if (rb == 31)  a.mov(x86::rdx, imm(disp));                       // va -> RDX
       else        {  a.mov(x86::rdx, reg(rb)); if (disp) a.add(x86::rdx, imm(disp)); }
       if (ra == 31)  a.xor_(x86::r9d, x86::r9d);                       // value -> R9 (R31 == 0)

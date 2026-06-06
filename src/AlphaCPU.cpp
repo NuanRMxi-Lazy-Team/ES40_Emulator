@@ -824,7 +824,7 @@ void CAlphaCPU::jit_run(int budget)
 				// compare. Ra (lra) is the value source; Rb is the base. HW_ST physical (0x1f func
 				// 0/1) stores too, with a physical (untranslated) address and a 12-bit disp.
 				const bool is_hwst = (opc == 0x1f) && (((ins >> 12) & 0xf) <= 1);
-				const bool isst = (opc == 0x2c || opc == 0x2d || is_hwst);
+				const bool isst = (opc == 0x2c || opc == 0x2d || opc == 0x0d || opc == 0x0e || is_hwst);  // STL/STQ/STW/STB
 				u64 sva = 0, sval = 0;
 				if (isst)
 				{
