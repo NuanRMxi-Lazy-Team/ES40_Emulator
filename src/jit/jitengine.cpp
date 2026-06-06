@@ -17,6 +17,7 @@ enum SafeOp {
   OP_CMOV,                       // INTL (0x11) conditional moves CMOVxx: Rc = cond(Ra) ? op2 : Rc
   OP_CMPEQ, OP_CMPLT, OP_CMPLE, OP_CMPULT, OP_CMPULE,
   OP_SLL, OP_SRL, OP_SRA, OP_MULQ,
+  OP_EXTL, OP_EXTH, OP_INSL, OP_INSH, OP_MSKL, OP_MSKH, OP_ZAP,   // INTS (0x12) byte-manip (Rb&7 keyed)
   OP_NOP, OP_MFENCE,             // MISC (0x18): prefetch/cache hints (no-op), barriers (mfence)
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
   OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
@@ -66,9 +67,16 @@ SafeOp classify(uint32_t ins, bool pal_block)
           return OP_CMOV;
       }
       break;
-    case 0x12: // INTS
+    case 0x12: // INTS: shifts + byte-manipulation (extract / insert / mask / zap), Rb&7 keyed
       switch (func) {
         case 0x39: return OP_SLL; case 0x34: return OP_SRL; case 0x3c: return OP_SRA;
+        case 0x06: case 0x16: case 0x26: case 0x36: return OP_EXTL;   // EXTBL/WL/LL/QL
+        case 0x5a: case 0x6a: case 0x7a:            return OP_EXTH;   // EXTWH/LH/QH
+        case 0x0b: case 0x1b: case 0x2b: case 0x3b: return OP_INSL;   // INSBL/WL/LL/QL
+        case 0x57: case 0x67: case 0x77:            return OP_INSH;   // INSWH/LH/QH
+        case 0x02: case 0x12: case 0x22: case 0x32: return OP_MSKL;   // MSKBL/WL/LL/QL
+        case 0x52: case 0x62: case 0x72:            return OP_MSKH;   // MSKWH/LH/QH
+        case 0x30: case 0x31:                       return OP_ZAP;    // ZAP / ZAPNOT
       }
       break;
     case 0x13: // INTM
@@ -251,6 +259,18 @@ void CJitEngine::flush_non_global()
     }
   }
 }
+
+// ZAP/ZAPNOT byte-expand: g_zapnot_mask[b] has byte i = 0xFF where bit i of b is set (ZAPNOT keeps
+// those bytes; ZAP keeps the complement). Compiled ZAP indexes this instead of an 8-way bit test.
+static uint64_t g_zapnot_mask[256];
+static const bool g_zapnot_init = [] {
+  for (int b = 0; b < 256; ++b) {
+    uint64_t m = 0;
+    for (int i = 0; i < 8; ++i) if (b & (1 << i)) m |= (uint64_t) 0xff << (i * 8);
+    g_zapnot_mask[b] = m;
+  }
+  return true;
+}();
 
 void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper, void* hw_st_helper)
 {
@@ -660,6 +680,68 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
         case 0x16: a.cmovz(x86::r10, x86::rcx);  break;   // CMOVLBC (!(Ra & 1))
       }
       a.mov(reg(rc), x86::r10);
+      continue;
+    }
+
+    // INTS (0x12) byte-manipulation: extract/insert/mask/zap. Rc = a shift+mask of Ra keyed on the
+    // byte position pos = Rb&7 (the selector V_2). Pure ALU -> verify-checked by the GPR compare.
+    // RAX = Ra/result, CL = the variable shift, R10/R11 scratch, EDX preserves pos for the H-form
+    // pos==0 edge cases. Mirrors cpu_bwx.h; size (0=B 1=W 2=L 3=Q) and mask come from the function.
+    if (op == OP_EXTL || op == OP_EXTH || op == OP_INSL || op == OP_INSH
+        || op == OP_MSKL || op == OP_MSKH || op == OP_ZAP) {
+      if (rc == 31) continue;
+      const uint32_t f = (ins >> 5) & 0x7f;
+      const int size = (f >> 4) & 3;
+      const uint64_t mask = (size == 0) ? (uint64_t) 0xff : (size == 1) ? (uint64_t) 0xffff
+                          : (size == 2) ? (uint64_t) 0xffffffff : ~(uint64_t) 0;
+      op1_rax();                                                  // rax = Ra (data)
+      op2_rcx();                                                  // rcx = Rb / literal (selector)
+      switch (op) {
+        case OP_EXTL:                                             // (Ra >> pos*8) & mask
+          a.and_(x86::ecx, imm(7)); a.shl(x86::ecx, imm(3));
+          a.shr(x86::rax, x86::cl);
+          if (size != 3) { a.mov(x86::r10, imm(mask)); a.and_(x86::rax, x86::r10); }
+          break;
+        case OP_EXTH:                                             // (Ra << ((64-pos*8)&63)) & mask
+          a.and_(x86::ecx, imm(7)); a.shl(x86::ecx, imm(3));
+          a.neg(x86::ecx); a.and_(x86::ecx, imm(63));
+          a.shl(x86::rax, x86::cl);
+          if (size != 3) { a.mov(x86::r10, imm(mask)); a.and_(x86::rax, x86::r10); }
+          break;
+        case OP_INSL:                                             // (Ra & mask) << pos*8
+          if (size != 3) { a.mov(x86::r10, imm(mask)); a.and_(x86::rax, x86::r10); }
+          a.and_(x86::ecx, imm(7)); a.shl(x86::ecx, imm(3));
+          a.shl(x86::rax, x86::cl);
+          break;
+        case OP_INSH:                                             // pos ? ((Ra&mask) >> ((64-pos*8)&63)) : 0
+          if (size != 3) { a.mov(x86::r10, imm(mask)); a.and_(x86::rax, x86::r10); }
+          a.and_(x86::ecx, imm(7)); a.mov(x86::edx, x86::ecx);
+          a.shl(x86::ecx, imm(3)); a.neg(x86::ecx); a.and_(x86::ecx, imm(63));
+          a.shr(x86::rax, x86::cl);
+          a.xor_(x86::r11d, x86::r11d); a.test(x86::edx, x86::edx); a.cmovz(x86::rax, x86::r11);
+          break;
+        case OP_MSKL:                                             // Ra & ~(mask << pos*8)
+          a.and_(x86::ecx, imm(7)); a.shl(x86::ecx, imm(3));
+          a.mov(x86::r10, imm(mask)); a.shl(x86::r10, x86::cl);
+          a.not_(x86::r10); a.and_(x86::rax, x86::r10);
+          break;
+        case OP_MSKH:                                             // pos ? (Ra & ~(mask >> ((64-pos*8)&63))) : Ra
+          a.and_(x86::ecx, imm(7)); a.mov(x86::edx, x86::ecx);
+          a.shl(x86::ecx, imm(3)); a.neg(x86::ecx); a.and_(x86::ecx, imm(63));
+          a.mov(x86::r10, imm(mask)); a.shr(x86::r10, x86::cl); a.not_(x86::r10);
+          a.mov(x86::r11, x86::rax); a.and_(x86::r11, x86::r10);
+          a.test(x86::edx, x86::edx); a.cmovnz(x86::rax, x86::r11);
+          break;
+        case OP_ZAP:                                              // Ra & byte_expand(selector); ZAP inverts
+          a.movzx(x86::ecx, x86::cl);
+          a.mov(x86::r11, imm((uint64_t) &g_zapnot_mask[0]));
+          a.mov(x86::r10, x86::qword_ptr(x86::r11, x86::rcx, 3));   // g_zapnot_mask[selector & 0xff]
+          if (f == 0x30) a.not_(x86::r10);                        // ZAP keeps bytes whose bit is CLEAR
+          a.and_(x86::rax, x86::r10);
+          break;
+        default: break;
+      }
+      a.mov(reg(rc), x86::rax);
       continue;
     }
 
