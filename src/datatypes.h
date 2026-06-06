@@ -160,6 +160,24 @@ inline u64 sext_u64_8(u64 a)
 }
 
 /**
+ * Zero-extend an 8-bit value to 64 bits (LDBU). Masks off everything above the byte so that an
+ * MMIO device read wider than the access size is narrowed to the architected byte (HRM: LDBU is
+ * "Load zero-extended byte"). DRAM byte reads are already <= 0xff, so this is a no-op there.
+ **/
+inline u64 zext_u64_8(u64 a)
+{
+  return a & U64(0x00000000000000ff);
+}
+
+/**
+ * Zero-extend a 16-bit value to 64 bits (LDWU).
+ **/
+inline u64 zext_u64_16(u64 a)
+{
+  return a & U64(0x000000000000ffff);
+}
+
+/**
  * Sign-extend a 12-bit value to 64 bits.
  **/
 inline u64 sext_u64_12(u64 a)

@@ -20,6 +20,7 @@ enum SafeOp {
   OP_EXTL, OP_EXTH, OP_INSL, OP_INSH, OP_MSKL, OP_MSKH, OP_ZAP,   // INTS (0x12) byte-manip (Rb&7 keyed)
   OP_NOP, OP_MFENCE,             // MISC (0x18): prefetch/cache hints (no-op), barriers (mfence)
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
+  OP_LDBU, OP_LDWU,              // BWX byte/word loads (0x0a/0x0c): Ra = zero-extend MEM[Rb+disp16].{b,w}
   OP_STQ, OP_STL,                // memory-format stores: MEM[Rb + disp16] = Ra
   OP_STB, OP_STW,                // BWX byte/word stores (0x0e/0x0d): MEM[Rb + disp16].{b,w} = Ra
   OP_LDA, OP_LDAH,               // load-address: Ra = Rb + disp16 (<<16 for LDAH); pure ALU
@@ -142,6 +143,8 @@ SafeOp classify(uint32_t ins, bool pal_block)
     // OP_JMP codegen/verify paths below stay dormant; revisit once per-dispatch overhead drops.
     case 0x28: return OP_LDL;   // memory-format loads (Ra = MEM[Rb+disp16])
     case 0x29: return OP_LDQ;
+    case 0x0a: return OP_LDBU;  // BWX byte/word loads (Ra = zero-extend MEM[Rb+disp16].{b,w})
+    case 0x0c: return OP_LDWU;
     case 0x2c: return OP_STL;   // memory-format stores (MEM[Rb+disp16] = Ra)
     case 0x2d: return OP_STQ;
     case 0x0e: return OP_STB;   // BWX byte/word stores (MEM[Rb+disp16].{b,w} = Ra low bits)
@@ -390,10 +393,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     };
 
     // Memory-format loads: va = regs[Rb] + disp16.
-    if (op == OP_LDQ || op == OP_LDL) {
+    if (op == OP_LDQ || op == OP_LDL || op == OP_LDBU || op == OP_LDWU) {
       if (ra == 31) continue;            // LDx R31 is a NOP (interpreter skips the read)
       const int disp = (int) (int16_t) (ins & 0xFFFF);
-      const int size_bits = (op == OP_LDQ) ? 64 : 32;
+      const int size_bits = (op == OP_LDQ) ? 64 : (op == OP_LDL) ? 32 : (op == OP_LDWU) ? 16 : 8;
       const int amask = (size_bits / 8) - 1;
       if (rb == 31)  a.mov(x86::rdx, imm(disp));         // va -> RDX
       else        {  a.mov(x86::rdx, reg(rb)); if (disp) a.add(x86::rdx, imm(disp)); }
@@ -415,8 +418,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
         a.add(x86::eax, x86::r14d);                       // + earlier chained iterations
         a.jmp(done);
         a.bind(ok);
-        if (op == OP_LDQ) a.mov(x86::rax, x86::qword_ptr(x86::rsp, 32));
-        else              a.movsxd(x86::rax, x86::dword_ptr(x86::rsp, 32));
+        if      (op == OP_LDQ)  a.mov(x86::rax, x86::qword_ptr(x86::rsp, 32));
+        else if (op == OP_LDL)  a.movsxd(x86::rax, x86::dword_ptr(x86::rsp, 32));
+        else if (op == OP_LDWU) a.movzx(x86::eax, x86::word_ptr(x86::rsp, 32));   // BWX: zero-extend
+        else                    a.movzx(x86::eax, x86::byte_ptr(x86::rsp, 32));   // LDBU
         a.mov(reg(ra), x86::rax);
       };
 
@@ -447,8 +452,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       a.or_(x86::rax, x86::r10);                                        // rax = phys
       a.cmp(x86::rax, x86::qword_ptr(x86::rsi, m_off.dram_size));       a.jae(slow);
       a.mov(x86::r10, x86::qword_ptr(x86::rsi, m_off.dram_ptr));
-      if (op == OP_LDQ) a.mov(x86::rax, x86::qword_ptr(x86::r10, x86::rax));
-      else              a.movsxd(x86::rax, x86::dword_ptr(x86::r10, x86::rax));
+      if      (op == OP_LDQ)  a.mov(x86::rax, x86::qword_ptr(x86::r10, x86::rax));
+      else if (op == OP_LDL)  a.movsxd(x86::rax, x86::dword_ptr(x86::r10, x86::rax));
+      else if (op == OP_LDWU) a.movzx(x86::eax, x86::word_ptr(x86::r10, x86::rax));   // BWX: zero-extend
+      else                    a.movzx(x86::eax, x86::byte_ptr(x86::r10, x86::rax));   // LDBU
       a.mov(reg(ra), x86::rax);
       a.jmp(ldone);
       a.bind(slow);

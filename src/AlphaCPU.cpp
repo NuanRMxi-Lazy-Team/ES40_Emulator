@@ -811,7 +811,7 @@ void CAlphaCPU::jit_run(int budget)
 				// HW_LD physical (0x1b, func 0/1) is a load too: the compiled form replays through
 				// this same vlog, but its address is physical (untranslated) with a 12-bit disp.
 				const bool is_hwld = (opc == 0x1b) && (((ins >> 12) & 0xf) <= 1);
-				const bool isld = (opc == 0x28 || opc == 0x29 || is_hwld) && lra != 31;
+				const bool isld = (opc == 0x28 || opc == 0x29 || opc == 0x0a || opc == 0x0c || is_hwld) && lra != 31;  // +LDBU/LDWU
 				u64 eva = 0;
 				if (isld)
 				{
@@ -1037,6 +1037,14 @@ int CAlphaCPU::jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
 		dpc.valid = true;
 	}
 
+	// DRAM only: bail on MMIO so the interpreter does device reads (side effects + ordering). This
+	// MUST precede the verify replay: production bails here, and a device byte/word read is NOT
+	// size-truncated (LDBU/LDWU use READ_VIRT, no sext func), so replaying an MMIO value and then
+	// re-truncating it with movzx would falsely mismatch the interpreter. Bailing -> the compiled
+	// block stops at the load (done < prefix_len) and the verify skips the compare, matching prod.
+	if (phys >= cpu->dram_size)
+		return 1;
+
 	// Verify replay: return the value the interpreter pass loaded here, rather than
 	// re-reading (another CPU may have written it)
 	if (cpu->m_jit_vreplay)
@@ -1052,9 +1060,6 @@ int CAlphaCPU::jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
 		return 0;
 	}
 
-	// DRAM only: bail on MMIO so the interpreter does device reads (side effects + ordering).
-	if (phys >= cpu->dram_size)
-		return 1;
 	*out = dram_read(cpu->dram_ptr, phys, size_bits);
 	return 0;
 }
@@ -1065,6 +1070,12 @@ int CAlphaCPU::jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
 // ordered device read. Returns 0 on success, 1 on a bail.
 int CAlphaCPU::jit_read_phys(CAlphaCPU* cpu, u64 phys, int size_bits, u64* out)
 {
+	// MMIO: bail before the replay so verify models production (which bails here). A device read
+	// isn't size-truncated, so a replayed+re-truncated value would falsely mismatch. dram_size is
+	// page-aligned and the align below only rounds within 8 bytes, so this raw check is exact.
+	if (phys >= cpu->dram_size)
+		return 1;
+
 	if (cpu->m_jit_vreplay)
 	{
 		if (phys != cpu->m_jit_vaddr[cpu->m_jit_vlog_i])
@@ -1079,8 +1090,6 @@ int CAlphaCPU::jit_read_phys(CAlphaCPU* cpu, u64 phys, int size_bits, u64* out)
 	}
 
 	phys &= ~((u64) (size_bits / 8) - 1);     // align like READ_PHYS_NT (ALIGN_PHYS)
-	if (phys >= cpu->dram_size)
-		return 1;                              // MMIO: let the interpreter do the ordered read
 	*out = dram_read(cpu->dram_ptr, phys, size_bits);
 	return 0;
 }
