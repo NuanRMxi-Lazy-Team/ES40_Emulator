@@ -811,10 +811,14 @@ void CAlphaCPU::jit_run(int budget)
 				// HW_LD physical (0x1b, func 0/1) is a load too: the compiled form replays through
 				// this same vlog, but its address is physical (untranslated) with a 12-bit disp.
 				const bool is_hwld = (opc == 0x1b) && (((ins >> 12) & 0xf) <= 1);
+				// RPCC/RC/RS (MISC 0x18) read CPU state the verify can't re-derive; the compiled forms
+				// pull their value from this same load log (jit_misc replays it), so log them like loads.
+				const u32  miscfn    = (ins & 0xFFFF);
+				const bool is_miscrd = (opc == 0x18) && (miscfn == 0xC000 || miscfn == 0xE000 || miscfn == 0xF000);
 				const bool isld = (opc == 0x28 || opc == 0x29 || opc == 0x0a || opc == 0x0c
-				                   || opc == 0x2a || opc == 0x2b || opc == 0x0b || is_hwld) && lra != 31;  // +LDBU/LDWU +LDx_L +LDQ_U
+				                   || opc == 0x2a || opc == 0x2b || opc == 0x0b || is_hwld || is_miscrd) && lra != 31;  // +LDBU/LDWU +LDx_L +LDQ_U +RPCC/RC/RS
 				u64 eva = 0;
-				if (isld)
+				if (isld && !is_miscrd)   // misc reads have no effective address -- only a logged value
 				{
 					const int lrb = (ins >> 16) & 0x1F;
 					const int ldisp = is_hwld ? (int) ((int32_t) (ins << 20) >> 20)   // HW_LD: 12-bit
@@ -1004,7 +1008,8 @@ void CAlphaCPU::jit_run(int budget)
 				                     (void*) &CAlphaCPU::jit_opcdec, (void*) &CAlphaCPU::jit_hw_mfpr,
 				                     (void*) &CAlphaCPU::jit_read_phys, (void*) &CAlphaCPU::jit_hw_mtpr,
 				                     (void*) &CAlphaCPU::jit_write_phys, (void*) &CAlphaCPU::jit_indirect,
-				                     (void*) &CAlphaCPU::jit_read_locked, (void*) &CAlphaCPU::jit_stc);
+				                     (void*) &CAlphaCPU::jit_read_locked, (void*) &CAlphaCPU::jit_stc,
+				                     (void*) &CAlphaCPU::jit_misc);
 		}
 	}
 }
@@ -1069,6 +1074,34 @@ int CAlphaCPU::jit_read(CAlphaCPU* cpu, u64 va, int size_bits, u64* out)
 
 	*out = dram_read(cpu->dram_ptr, phys, size_bits);
 	return 0;
+}
+
+// JIT MISC read helper (static). RPCC (sel 0): the wall-clock-pinned cycle counter (DO_RPCC, JIT
+// lane). RC (sel 1) / RS (sel 2): read the interrupt flag, then clear / set it. All three read
+// state the differential verify can't re-derive (cc advances only at the jit_run boundary; the
+// flag is consumed by the read), so in verify we replay the interp pass's value -- like a load.
+u64 CAlphaCPU::jit_misc(CAlphaCPU* cpu, u32 sel)
+{
+	if (cpu->m_jit_vreplay)
+		return cpu->m_jit_vlog[cpu->m_jit_vlog_i++];   // replay; no re-read, no double side effect
+
+	switch (sel)
+	{
+	case 0:                                            // RPCC: Ra = cc_offset : cc[31:0]
+		return ((u64) cpu->state.cc_offset << 32) | (cpu->state.cc & U64(0xffffffff));
+	case 1:                                            // RC: Ra = bIntrFlag; bIntrFlag = false
+	{
+		u64 v = cpu->state.bIntrFlag ? 1 : 0;
+		cpu->state.bIntrFlag = false;
+		return v;
+	}
+	default:                                           // RS (sel 2): Ra = bIntrFlag; bIntrFlag = true
+	{
+		u64 v = cpu->state.bIntrFlag ? 1 : 0;
+		cpu->state.bIntrFlag = true;
+		return v;
+	}
+	}
 }
 
 // JIT load-locked helper (static). LDx_L: the verify-checked load PLUS cpu_lock -- the LL/SC

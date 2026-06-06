@@ -21,6 +21,7 @@ enum SafeOp {
   OP_SLL, OP_SRL, OP_SRA, OP_MULQ,
   OP_EXTL, OP_EXTH, OP_INSL, OP_INSH, OP_MSKL, OP_MSKH, OP_ZAP,   // INTS (0x12) byte-manip (Rb&7 keyed)
   OP_NOP, OP_MFENCE,             // MISC (0x18): prefetch/cache hints (no-op), barriers (mfence)
+  OP_RPCC, OP_RC, OP_RS,         // MISC (0x18) state reads (Ra dest): cycle counter / read-and-clear,set intr flag
   OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
   OP_LDBU, OP_LDWU,              // BWX byte/word loads (0x0a/0x0c): Ra = zero-extend MEM[Rb+disp16].{b,w}
   OP_LDL_L, OP_LDQ_L,            // load-locked (0x2a/0x2b): Ra = MEM[Rb+disp16] + establish LL/SC monitor
@@ -99,8 +100,14 @@ SafeOp classify(uint32_t ins, bool pal_block)
         case 0x4000: case 0x4400: return OP_MFENCE;  // MB, WMB
         case 0x8000: case 0xA000: case 0xE800:       // FETCH, FETCH_M, ECB
         case 0xF800: case 0xFC00: return OP_NOP;     // WH64, WH64EN
+        // RPCC/RC/RS read time-varying / consumed state into Ra -- compile the value-returning
+        // forms (Ra!=31) so the verify can log+replay the read; Ra==31 (no GPR dest; RC/RS still
+        // side-effect the flag) falls through to the interpreter.
+        case 0xC000: if (((ins >> 21) & 0x1f) != 31) return OP_RPCC; break;  // RPCC (cycle counter)
+        case 0xE000: if (((ins >> 21) & 0x1f) != 31) return OP_RC;   break;  // RC (read & clear flag)
+        case 0xF000: if (((ins >> 21) & 0x1f) != 31) return OP_RS;   break;  // RS (read & set flag)
       }
-      break;                    // RPCC (0xc000) / RC / RS read state or have side effects -> interpret
+      break;
     case 0x00: {                // CALL_PAL: compile valid standard funcs (priv 0x00-0x3f, unpriv 0x80-0xbf)
       const uint32_t fn = ins & 0x1FFFFFFF;
       if (fn <= 0x3F || (fn >= 0x80 && fn <= 0xBF)) return OP_CALL_PAL;
@@ -298,7 +305,7 @@ static const bool g_zapnot_init = [] {
   return true;
 }();
 
-void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper, void* hw_st_helper, void* indirect_helper, void* read_locked_helper, void* stc_helper)
+void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_size, void* read_helper, void* write_helper, void* opcdec_helper, void* hw_mfpr_helper, void* hw_ld_helper, void* hw_mtpr_helper, void* hw_st_helper, void* indirect_helper, void* read_locked_helper, void* stc_helper, void* misc_helper)
 {
   using namespace asmjit;
   b->compiled = true;
@@ -331,9 +338,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       // compilable subset is already settled, so it points at the next NEW target rather than a
       // decided one: 0x00 CALL_PAL (terminator), 0x1b HW_LD / 0x1f HW_ST (physical done;
       // conditional/virtual forms side-effecting), 0x1d HW_MTPR (pure-store IPRs done; rest
-      // side-effecting), 0x10 INTA (scaled-L + CMPBGE done; only /V overflow-trap variants left).
+      // side-effecting), 0x10 INTA (scaled-L + CMPBGE done; only /V overflow-trap variants left),
+      // 0x18 MISC (barriers->mfence + hints->nop done; RPCC async-cc read / RC,RS flag-RMW interpreted).
       // JMP (0x1a) + HW_RET (0x1e) are now compiled+chained. Stats count all.
-      if (!m_first_breaker_logged && bop != 0x00 && bop != 0x1b && bop != 0x1d && bop != 0x1f && bop != 0x10) {
+      if (!m_first_breaker_logged && bop != 0x00 && bop != 0x1b && bop != 0x1d && bop != 0x1f && bop != 0x10 && bop != 0x18) {
         m_first_breaker_logged = true;
         printf("[JIT][PUNCH] first unhandled breaker: %s(0x%02x) ins=%08x at pc=%016llx%s\n",
                opcode_name(bop), bop, words[plen],
@@ -659,6 +667,19 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
         a.call(x86::rax);                              // -> RAX = IPR value
         a.mov(reg(ra), x86::rax);                      // Ra = value (reg() applies the PALshadow remap)
       }
+      continue;
+    }
+
+    // MISC state reads RPCC/RC/RS (0x18): Ra = jit_misc(cpu, sel). The helper reads the cycle
+    // counter / interrupt flag (clearing or setting it) in production, and replays the interp
+    // pass's value in verify. Dest is Ra (not Rc); classify gated Ra!=31, so a store always happens.
+    if (op == OP_RPCC || op == OP_RC || op == OP_RS) {
+      const int sel = (op == OP_RPCC) ? 0 : (op == OP_RC) ? 1 : 2;
+      a.mov(x86::rcx, x86::rsi);                       // cpu
+      a.mov(x86::edx, imm(sel));                       // selector: 0=RPCC, 1=RC, 2=RS
+      a.mov(x86::rax, imm((uint64_t) misc_helper));
+      a.call(x86::rax);                                // -> RAX = value (replayed in verify)
+      a.mov(reg(ra), x86::rax);                        // Ra = value (reg() applies the PALshadow remap)
       continue;
     }
 

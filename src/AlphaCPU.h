@@ -512,6 +512,9 @@ private:
   static void jit_hw_mtpr(CAlphaCPU* cpu, u32 function, u64 value);
   // Indirect jump (JMP/HW_RET): look up the target block; return its chained re-entry or null.
   static void* jit_indirect(CAlphaCPU* cpu, u64 target);
+  // MISC (0x18) state reads: sel 0=RPCC (cycle counter), 1=RC, 2=RS (read interrupt flag +
+  // clear/set). Value the verify can't re-derive -> replayed from the load log like a load.
+  static u64 jit_misc(CAlphaCPU* cpu, u32 sel);
   // Verify support: the interpreter pass records each value it loads, and the
   // compiled pass replays them instead of re-reading memory - false mismatch fix
   bool m_jit_vreplay = false;  // compiled pass: replay recorded loads, don't re-read
