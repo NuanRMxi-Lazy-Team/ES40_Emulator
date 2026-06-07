@@ -811,14 +811,16 @@ void CAlphaCPU::jit_run(int budget)
 				// HW_LD physical (0x1b, func 0/1) is a load too: the compiled form replays through
 				// this same vlog, but its address is physical (untranslated) with a 12-bit disp.
 				const bool is_hwld = (opc == 0x1b) && (((ins >> 12) & 0xf) <= 1);
-				// RPCC/RC/RS (MISC 0x18) read CPU state the verify can't re-derive; the compiled forms
-				// pull their value from this same load log (jit_misc replays it), so log them like loads.
+				// RPCC/RC/RS (MISC 0x18) and ISUM (HW_MFPR 0x19 fn 0x0d) read CPU state the verify can't
+				// re-derive; the compiled forms pull their value from this same load log (jit_misc /
+				// jit_hw_mfpr replay it), so log them like loads.
 				const u32  miscfn    = (ins & 0xFFFF);
 				const bool is_miscrd = (opc == 0x18) && (miscfn == 0xC000 || miscfn == 0xE000 || miscfn == 0xF000);
+				const bool is_isum   = (opc == 0x19) && (((ins >> 8) & 0xff) == 0x0d);   // ISUM: async interrupt-summary
 				const bool isld = (opc == 0x28 || opc == 0x29 || opc == 0x0a || opc == 0x0c
-				                   || opc == 0x2a || opc == 0x2b || opc == 0x0b || is_hwld || is_miscrd) && lra != 31;  // +LDBU/LDWU +LDx_L +LDQ_U +RPCC/RC/RS
+				                   || opc == 0x2a || opc == 0x2b || opc == 0x0b || is_hwld || is_miscrd || is_isum) && lra != 31;  // +LDBU/LDWU +LDx_L +LDQ_U +RPCC/RC/RS +ISUM
 				u64 eva = 0;
-				if (isld && !is_miscrd)   // misc reads have no effective address -- only a logged value
+				if (isld && !is_miscrd && !is_isum)   // misc/ISUM reads have no effective address -- only a logged value
 				{
 					const int lrb = (ins >> 16) & 0x1F;
 					const int ldisp = is_hwld ? (int) ((int32_t) (ins << 20) >> 20)   // HW_LD: 12-bit
@@ -1345,6 +1347,12 @@ u64 CAlphaCPU::jit_hw_mfpr(CAlphaCPU* cpu, u32 ins, u64 cur)
 	const auto& state    = cpu->state;
 	const u32   function = (ins >> 8) & 0xff;
 
+	// ISUM (0x0d) reads the live async interrupt-request lines (eir/slr/crr/pcr), which the
+	// differential verify can't re-derive - changes between the interp and compiled passes.
+	// Replay the interp value here
+	if (cpu->m_jit_vreplay && function == 0x0d)
+		return cpu->m_jit_vlog[cpu->m_jit_vlog_i++];
+
 	if ((function & 0xc0) == 0x40)   // PCTX
 		return ((u64) state.asn << 39) | ((u64) state.astrr << 9) | ((u64) state.aster << 5)
 		     | (state.fpen ? U64(0x1) << 2 : 0) | (state.ppcen ? U64(0x1) << 1 : 0);
@@ -1360,8 +1368,8 @@ u64 CAlphaCPU::jit_hw_mfpr(CAlphaCPU* cpu, u32 ins, u64 cur)
 		     | (((u64) state.sien) << 13) | (((u64) state.asten) << 13)
 		     | (((u64) state.cm) << 3);
 	case 0x0c: return ((u64) state.sir) << 13;               // SIRR
-	case 0x0d:                                               // ISUM -- dormant: classify gates this
-		// out of the JIT (it reads async interrupt-request lines); kept here for completeness.
+	case 0x0d:                                               // ISUM (production path: read the live async
+		// interrupt-request lines; the verify replays via the m_jit_vreplay short-circuit at the top).
 		return (((u64) (state.eir & state.eien)) << 33)
 		     | (((u64) (state.slr & state.slen)) << 32)
 		     | (((u64) (state.crr & state.cren)) << 31)

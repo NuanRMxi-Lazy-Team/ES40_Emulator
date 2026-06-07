@@ -20,6 +20,7 @@ enum SafeOp {
   OP_CMOV,                       // INTL (0x11) conditional moves CMOVxx: Rc = cond(Ra) ? op2 : Rc
   OP_CMPEQ, OP_CMPLT, OP_CMPLE, OP_CMPULT, OP_CMPULE,
   OP_SLL, OP_SRL, OP_SRA, OP_MULQ,
+  OP_MULL, OP_UMULH,             // INTM (0x13): MULL = sext32(Ra*op2); UMULH = hi64 of unsigned Ra*op2
   OP_EXTL, OP_EXTH, OP_INSL, OP_INSH, OP_MSKL, OP_MSKH, OP_ZAP,   // INTS (0x12) byte-manip (Rb&7 keyed)
   OP_NOP, OP_MFENCE,             // MISC (0x18): prefetch/cache hints (no-op), barriers (mfence)
   OP_RPCC, OP_RC, OP_RS,         // MISC (0x18) state reads (Ra dest): cycle counter / read-and-clear,set intr flag
@@ -92,8 +93,10 @@ SafeOp classify(uint32_t ins, bool pal_block)
         case 0x30: case 0x31:                       return OP_ZAP;    // ZAP / ZAPNOT
       }
       break;
-    case 0x13: // INTM
+    case 0x13: // INTM (integer multiply). MULL/V (0x40) + MULQ/V (0x60) overflow-trap -> interpret.
       if (func == 0x20) return OP_MULQ;
+      if (func == 0x00) return OP_MULL;    // 32-bit multiply, low 32 sign-extended
+      if (func == 0x30) return OP_UMULH;   // high 64 bits of the unsigned 128-bit product
       break;
     case 0x1c: // FPTI (CIX/BWX/MVI/FP-moves): only the pure-ALU sign-extends compile here. CTPOP/
       // CTLZ/CTTZ (bit-count: zero-handling + popcnt/lzcnt CPU feature), MVI packed media (PERR/
@@ -123,10 +126,9 @@ SafeOp classify(uint32_t ins, bool pal_block)
     case 0x08: return OP_LDA;   // load address (Ra = Rb + disp16) -- pure ALU, no memory
     case 0x09: return OP_LDAH;  // load address high (Ra = Rb + (disp16 << 16))
     case 0x19:                  // HW_MFPR: read IPR -> Ra. PALmode-only (else OPCDEC).
-      // ISUM (fn 0x0d) aggregates the live hardware interrupt requests (eir/slr/crr/pcr) that
-      // devices raise from other threads, so it changes async - the verify's interp and
-      // compiled reads of it legitimately differ. Leave only that one to the interpreter
-      if (!pal_block || ((ins >> 8) & 0xff) == 0x0d) return OP_NONE;
+      // ISUM (fn 0x0d) aggregates the live async interrupt-request lines (eir/slr/crr/pcr that
+      // devices raise from other threads)
+      if (!pal_block) return OP_NONE;
       return OP_HW_MFPR;
     case 0x1b: {                // HW_LD: read phys[Rb+disp12] -> Ra. PALmode-only. Compile only the
       // physical longword/quadword forms (func 0/1, no translation). Locked (LL/SC), VPTE, virtual,
@@ -345,10 +347,10 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       // compilable subset is already settled, so it points at the next NEW target rather than a
       // decided one: 0x00 CALL_PAL (terminator), 0x1b HW_LD / 0x1f HW_ST (physical done;
       // conditional/virtual forms side-effecting), 0x1d HW_MTPR (pure-store IPRs done; rest
-      // side-effecting), 0x10 INTA (scaled-L + CMPBGE done; only /V overflow-trap variants left),
-      // 0x18 MISC (barriers->mfence + hints->nop done; RPCC async-cc read / RC,RS flag-RMW interpreted).
+      // side-effecting), 0x10 INTA + 0x13 INTM (non-trapping ops done; only /V overflow-trap variants left),
+      // 0x18 MISC (barriers/hints + RPCC/RC/RS via log/replay done; only the rare Ra==31 RC/RS forms interpret).
       // JMP (0x1a) + HW_RET (0x1e) are now compiled+chained. Stats count all.
-      if (!m_first_breaker_logged && bop != 0x00 && bop != 0x1b && bop != 0x1d && bop != 0x1f && bop != 0x10 && bop != 0x18) {
+      if (!m_first_breaker_logged && bop != 0x00 && bop != 0x1b && bop != 0x1d && bop != 0x1f && bop != 0x10 && bop != 0x18 && bop != 0x13) {
         m_first_breaker_logged = true;
         printf("[JIT][PUNCH] first unhandled breaker: %s(0x%02x) ins=%08x at pc=%016llx%s\n",
                opcode_name(bop), bop, words[plen],
@@ -876,6 +878,18 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       case OP_ORNOT: op1_rax(); op2_rcx(); a.not_(x86::rcx); a.or_(x86::rax, x86::rcx); break;
       case OP_EQV:   op1_rax(); op2_rcx(); a.not_(x86::rcx); a.xor_(x86::rax, x86::rcx); break;
       case OP_MULQ:  op1_rax(); op2_rcx(); a.imul(x86::rax, x86::rcx); break;
+      case OP_UMULH: op1_rax(); op2_rcx(); a.mul(x86::rcx); a.mov(x86::rax, x86::rdx); break;  // RDX:RAX = Ra*op2; hi64 = RDX
+      case OP_MULL:                                          // 32-bit multiply, low 32 sign-extended
+      {
+        if (ra == 31) a.xor_(x86::eax, x86::eax);
+        else          a.mov(x86::eax, reg32(ra));
+        if (islit)         a.mov(x86::ecx, imm(lit));
+        else if (rb == 31) a.xor_(x86::ecx, x86::ecx);
+        else               a.mov(x86::ecx, reg32(rb));
+        a.imul(x86::eax, x86::ecx);                          // eax = (Ra*op2)[31:0]
+        a.movsxd(x86::rax, x86::eax);
+        break;
+      }
 
       case OP_S4ADDQ: op1_rax(); a.shl(x86::rax, imm(2)); op2_rcx(); a.add(x86::rax, x86::rcx); break;
       case OP_S8ADDQ: op1_rax(); a.shl(x86::rax, imm(3)); op2_rcx(); a.add(x86::rax, x86::rcx); break;
