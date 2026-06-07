@@ -15,6 +15,7 @@ enum SafeOp {
   OP_S4ADDQ, OP_S8ADDQ, OP_S4SUBQ, OP_S8SUBQ,
   OP_S4ADDL, OP_S8ADDL, OP_S4SUBL, OP_S8SUBL,   // INTA (0x10) scaled longword: sext32((Ra*scale) +/- Rb)
   OP_CMPBGE,                                    // INTA (0x10) per-byte unsigned compare -> 8-bit mask
+  OP_SEXTB, OP_SEXTW,                            // FPTI (0x1c) CIX/BWX: Rc = sign-extend byte/word of op2
   OP_AND, OP_BIS, OP_XOR, OP_BIC, OP_ORNOT, OP_EQV,
   OP_CMOV,                       // INTL (0x11) conditional moves CMOVxx: Rc = cond(Ra) ? op2 : Rc
   OP_CMPEQ, OP_CMPLT, OP_CMPLE, OP_CMPULT, OP_CMPULE,
@@ -93,6 +94,12 @@ SafeOp classify(uint32_t ins, bool pal_block)
       break;
     case 0x13: // INTM
       if (func == 0x20) return OP_MULQ;
+      break;
+    case 0x1c: // FPTI (CIX/BWX/MVI/FP-moves): only the pure-ALU sign-extends compile here. CTPOP/
+      // CTLZ/CTTZ (bit-count: zero-handling + popcnt/lzcnt CPU feature), MVI packed media (PERR/
+      // MIN/MAX/PK/UNPK), and FTOIS/FTOIT (read the FP register file) stay interpreted for now.
+      if (func == 0x00) return OP_SEXTB;   // sign-extend byte of op2
+      if (func == 0x01) return OP_SEXTW;   // sign-extend word of op2
       break;
     case 0x18: // MISC: memory barriers -> mfence (keep MP ordering); prefetch/cache hints -> no-op
       switch (ins & 0xFFFF) {
@@ -878,6 +885,9 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       case OP_SLL: op1_rax(); op2_rcx(); a.shl(x86::rax, x86::cl); break;
       case OP_SRL: op1_rax(); op2_rcx(); a.shr(x86::rax, x86::cl); break;
       case OP_SRA: op1_rax(); op2_rcx(); a.sar(x86::rax, x86::cl); break;
+
+      case OP_SEXTB: op2_rcx(); a.movsx(x86::rax, x86::cl); break;   // Rc = sign-extend low byte of op2 (V_2)
+      case OP_SEXTW: op2_rcx(); a.movsx(x86::rax, x86::cx); break;   // Rc = sign-extend low word of op2 (V_2)
 
       case OP_CMPEQ:  op1_rax(); op2_rcx(); a.cmp(x86::rax, x86::rcx); a.sete(x86::al);  a.movzx(x86::eax, x86::al); break;
       case OP_CMPLT:  op1_rax(); op2_rcx(); a.cmp(x86::rax, x86::rcx); a.setl(x86::al);  a.movzx(x86::eax, x86::al); break;
