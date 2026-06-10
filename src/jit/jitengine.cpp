@@ -237,6 +237,9 @@ static inline uint64_t src_hash(const uint8_t* p, uint32_t n_instr)
 CJitEngine::JitBlock* CJitEngine::record(uint64_t virt_pc, uint64_t phys_pc, uint32_t asn, bool asm_global, uint32_t n_instr, const uint8_t* dram)
 {
   JitBlock& b = m_blocks[index_of(virt_pc)];
+  // record() is only reached after the dispatcher validated the live physical (phys_pc), so the
+  // block this returns is valid for the current ITB generation -- stamp it so chains skip re-checking.
+  b.gen = m_itb_gen;
   // Still valid + matching: nothing flushed us since last seen, so the code can't have changed.
   if (b.valid && b.tag == virt_pc && (b.asm_global || b.asn == asn) && b.phys == phys_pc) {
     b.n_instr = n_instr;

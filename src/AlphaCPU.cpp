@@ -1428,23 +1428,30 @@ void* CAlphaCPU::jit_indirect(CAlphaCPU* cpu, u64 target)
 		if (!cpu->state.sde) return nullptr;
 		return b->jit_body;
 	}
-	// Native target: the in-frame chain bypasses the dispatcher's `b->phys == start_phys` staleness
-	// check (see the hot-path guard ~line 789). Virtual+ASN keying can't see a page remap, so a stale
-	// block could tail-execute as wrong code -> OPCDEC / garbage. 
+	// Native target. FAST PATH: if the block was validated under the current ITB generation, no
+	// I-stream TB invalidate has happened since, so its phys is still good -- chain with no
+	// re-translation.
+	const u64 gen = cpu->m_jit->itb_gen();
+	if (b->gen == gen)
+		return b->jit_body;
+	// SLOW PATH (only right after an ITB invalidate): the in-frame chain bypasses the dispatcher's
+	// `b->phys == start_phys` staleness check (see the hot-path). Virtual+ASN keying can't see a 
+	// page remap, so a stale block (same tag+ASN, but the vpage now maps different physical bytes) 
+	// would tail-execute as wrong code -> OPCDEC / garbage. 
 	const int i = cpu->FindTBEntry(target, ACCESS_EXEC);
 	if (i < 0) return nullptr;                                  // ITB miss: let the dispatcher fault it in
 	const auto& e = cpu->state.tb[TB_INDEX_ITB][i];
-	const u64  tphys = e.phys | (target & e.keep_mask);
-	if (tphys != b->phys)
+	if ((e.phys | (target & e.keep_mask)) != b->phys)
 	{
 		// Caught a stale block: the page was remapped without flushing the JIT cache. Bail so the
 		// dispatcher re-records/recompiles. Rate-limited log -- this firing confirms the stale chain.
 		static int n = 0;
 		if (n++ < 50)
-			printf("[JIT] INDIRECT STALE: target=%016llx block_phys=%016llx live_phys=%016llx -- recompiling\n",
-			       (unsigned long long) target, (unsigned long long) b->phys, (unsigned long long) tphys);
+			printf("[JIT] INDIRECT STALE: target=%016llx block_phys=%016llx -- recompiling\n",
+			       (unsigned long long) target, (unsigned long long) b->phys);
 		return nullptr;
 	}
+	b->gen = gen;                                              // re-validated -> fast path henceforth
 	return b->jit_body;
 }
 #endif
@@ -3273,6 +3280,15 @@ void CAlphaCPU::add_tb(u64 virt, u64 pte_phys, u64 pte_flags, int flags, int asn
 		}
 	}
 
+#ifdef ES40_JIT
+	// A same-(virt,asn) ITB overwrite with a DIFFERENT physical is a code-page remap performed
+	// WITHOUT a separate TBIS; chained JIT blocks compiled from the old mapping must re-validate, 
+	// so bump the generation. A next_tb eviction (i reassigned below) replaces a DIFFERENT vpage 
+	// (not a remap of this one) and must NOT bump.
+	const bool itb_remap = (t == TB_INDEX_ITB) && (i >= 0)
+	                       && (state.tb[t][i].phys != (pte_phys & phys_mask));
+#endif
+
 	if (i < 0)
 	{
 		i = state.next_tb[t];
@@ -3300,6 +3316,10 @@ void CAlphaCPU::add_tb(u64 virt, u64 pte_phys, u64 pte_flags, int flags, int asn
 	state.tb[t][i].asn = asn;
 	state.tb[t][i].valid = true;
 	state.last_found_tb[t][rw] = i;
+
+#ifdef ES40_JIT
+	if (itb_remap && m_jit) m_jit->note_itb_invalidate();   // code page remapped in place -> chains re-validate
+#endif
 
 	if (t == TB_INDEX_DATA)
 		flush_data_page_cache();
@@ -3398,6 +3418,9 @@ void CAlphaCPU::tbia(int flags)
 	state.last_found_tb[t][1] = 0;
 	state.next_tb[t] = 0;
 	if (t == TB_INDEX_DATA) flush_data_page_cache();
+#ifdef ES40_JIT
+	else if (m_jit) m_jit->note_itb_invalidate();   // whole ITB cleared -> indirect chains re-validate phys
+#endif
 }
 
 /**
@@ -3417,6 +3440,9 @@ void CAlphaCPU::tbiap(int flags)
 			state.tb[t][i].valid = false;
 
 	if (t == TB_INDEX_DATA) flush_data_page_cache();
+#ifdef ES40_JIT
+	else if (m_jit) m_jit->note_itb_invalidate();   // process ITB entries cleared -> chains re-validate phys
+#endif
 }
 
 /**
@@ -3440,6 +3466,12 @@ void CAlphaCPU::tbis(u64 virt, int flags)
 	int i = FindTBEntry(virt, flags);
 	if (i >= 0)
 		state.tb[t][i].valid = false;
+#ifdef ES40_JIT
+	// A TBIS signals the OS is changing this code page's mapping. Bump the JIT generation even when
+	// the entry wasn't currently cached (i<0, already evicted from the TB), a JIT block compiled
+	// from this page is still stale and MUST re-validate before being chained.
+	if (m_jit) m_jit->note_itb_invalidate();
+#endif
 }
 
 void CAlphaCPU::tbis_d(u64 virt, int asn)

@@ -47,6 +47,8 @@ public:
     bool     compiled;    // compile has been attempted
     uint32_t body_off;    // jit_body's offset within code -- restores the chained entry on revalidate
     uint64_t src_sum;     // hash of the n_instr source words at compile time (revalidate vs self-mod)
+    uint64_t gen;         // ITB generation at which phys was last validated (see jit_indirect): a
+                          // cheap gen==m_itb_gen compare skips the per-chain TB re-translation
   };
 
   // Byte offsets (from the CAlphaCPU*) of the fields the inline load fast path reads,
@@ -80,6 +82,12 @@ public:
   void flush();
   void flush_non_global();   // flush only !asm_global blocks (the ASM-bit-clear / ASN icache flush)
 
+  // ITB-generation counter for the indirect-chain staleness check (jit_indirect). Bumped on every
+  // I-stream TB invalidate (tbia/tbiap/tbis, ACCESS_EXEC) ... those can remap a code page WITHOUT
+  // flushing the JIT, so a chained block could run stale bytes. 
+  inline void     note_itb_invalidate() { ++m_itb_gen; }
+  inline uint64_t itb_gen() const       { return m_itb_gen; }
+
 #ifdef JIT_VERIFY
   // Differential check: compiled result (jit) vs interpreter result (interp), r[0..30].
   void verify_compare(uint64_t blk_virt, const uint64_t* interp, const uint64_t* jit,
@@ -94,6 +102,7 @@ public:
 private:
   JitBlock m_blocks[kCacheEntries];
   uint64_t m_recorded;
+  uint64_t m_itb_gen = 0; // current ITB generation (bumped on every I-stream TB invalidate)
   uint64_t m_code_bytes;  // compiled bytes since last reclaim (see flush())
   void*    m_rt;          // asmjit::JitRuntime*
   JitOffsets m_off = {};  // field offsets for the inline load fast path
