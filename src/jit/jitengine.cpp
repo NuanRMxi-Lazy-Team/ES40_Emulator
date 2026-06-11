@@ -339,8 +339,8 @@ CJitEngine::JitBlock* CJitEngine::revalidate_flushed(uint64_t virt_pc, uint32_t 
 // (never while its compiled code could be executing); runtimes are per-CPU.
 void CJitEngine::reclaim_code()
 {
-  printf("[JIT][CPU%d] code reclaim: %llu MB freed\n", m_cpu_id,
-         (unsigned long long) (m_code_bytes >> 20));
+  //printf("[JIT][CPU%d] code reclaim: %llu MB freed\n", m_cpu_id,
+  //       (unsigned long long) (m_code_bytes >> 20));
   delete (asmjit::JitRuntime*) m_rt;
   m_rt = new asmjit::JitRuntime();
   m_code_bytes = 0;
@@ -845,6 +845,7 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       if (rb == 31) a.xor_(x86::r10d, x86::r10d);
       else          a.mov(x86::r10, reg(rb));
       a.and_(x86::r10, imm(~(uint64_t) 3));                       // target = Rb & ~3 (clear low 2)
+      if (b->tag & 3) a.or_(x86::r10, imm(b->tag & 3));           // DO_JMP: mode bits come from the current pc
       if (ra != 31) { a.mov(x86::rax, imm(ret & ~(uint64_t) 3)); a.mov(reg(ra), x86::rax); }  // return addr = PC & ~3 (DO_JMP)
       a.mov(x86::qword_ptr(x86::rsi, m_off.state_pc), x86::r10);  // state.pc = target
       continue;

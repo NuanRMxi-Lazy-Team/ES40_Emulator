@@ -868,6 +868,8 @@ void CAlphaCPU::jit_run(int budget)
 					const int jrb = (ins >> 16) & 0x1F;
 					const u64 jmask = (opc == 0x1e) ? ~U64(2) : ~U64(3);
 					jtgt = (jrb == 31 ? (u64) 0 : state.r[RREG(jrb)]) & jmask;
+					if (opc == 0x1a)
+						jtgt |= start_virt & 3;   // DO_JMP: mode bits come from the current pc
 				}
 				execute();
 				--budget;
