@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.70)"
+        required: true
+      run_id:
+        description: "Build run ID to release (blank = latest successful Build run on this branch)"
+        required: false
+        default: ""
+      notes_before:
+        description: "Optional note placed above the auto-generated notes"
+        required: false
+        default: ""
+      notes_after:
+        description: "Optional note placed below the auto-generated notes"
+        required: false
+        default: ""
+      draft:
+        description: "Create as draft for inspection before publishing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # create the tag and release
+  actions: read # download another run's artifacts
+
+jobs:
+  release:
+    name: Cut release from build artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve build run and its commit
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID_INPUT: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          run_id="$RUN_ID_INPUT"
+          if [ -z "$run_id" ]; then
+            run_id="$(gh run list -R "$GITHUB_REPOSITORY" --workflow build.yml \
+              --branch "$GITHUB_REF_NAME" --status success --limit 1 \
+              --json databaseId --jq '.[0].databaseId')"
+          fi
+          if [ -z "$run_id" ]; then
+            echo "No successful Build run found on branch $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+          head_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)"
+          echo "Releasing artifacts from run $run_id (commit $head_sha)"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts from the build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.run.outputs.run_id }}
+        run: gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -D dist
+
+      - name: Repack artifacts as release assets
+        run: |
+          set -euo pipefail
+
+          mkdir -p assets
+          for d in dist/*/; do
+            name="$(basename "$d")"
+            # GitHub mangles spaces in release asset names; use underscores instead.
+            name="${name// /_}"
+            (cd "$d" && zip -qr "$GITHUB_WORKSPACE/assets/$name.zip" .)
+          done
+          ls -l assets
+
+      - name: Compose release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          HEAD_SHA: ${{ steps.run.outputs.head_sha }}
+          NOTES_BEFORE: ${{ inputs.notes_before }}
+          NOTES_AFTER: ${{ inputs.notes_after }}
+        run: |
+          set -euo pipefail
+
+          # Same generator as the "Generate release notes" button used for previous releases.
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="$HEAD_SHA" --jq .body > generated.md
+
+          {
+            if [ -n "$NOTES_BEFORE" ]; then printf '%s\n\n' "$NOTES_BEFORE"; fi
+            cat generated.md
+            if [ -n "$NOTES_AFTER" ]; then printf '\n\n%s\n' "$NOTES_AFTER"; fi
+          } > notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          HEAD_SHA: ${{ steps.run.outputs.head_sha }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+
+          args=(--target "$HEAD_SHA" --title "$TAG" --notes-file notes.md)
+          if [ "$DRAFT" = "true" ]; then
+            args+=(--draft)
+          fi
+          gh release create "$TAG" "${args[@]}" assets/*.zip
