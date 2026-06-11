@@ -85,11 +85,12 @@ jobs:
 
       - name: Build and install latest SDL3
         if: ${{ !contains(matrix.configuration, 'NS') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          # Prefer release assets; gracefully handle API throttling/error payloads.
-          SDL_RELEASES_JSON="$(curl -fsSL -H 'User-Agent: github-actions' https://api.github.com/repos/libsdl-org/SDL/releases?per_page=10 || echo '[]')"
+          
+          SDL_RELEASES_JSON="$(curl -fsSL -H 'User-Agent: github-actions' -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/libsdl-org/SDL/releases?per_page=10 || echo '[]')"
           SDL3_URL="$(printf '%s' "$SDL_RELEASES_JSON" | python -c 'import sys,json,re; data=json.load(sys.stdin); data=[data] if isinstance(data,dict) else data; print(next((a.get("browser_download_url","") for rel in data for a in rel.get("assets",[]) if re.match(r"^SDL3-[0-9.]+\\.tar\\.gz$", a.get("name",""))), ""))')"
 
           if [ -z "$SDL3_URL" ]; then
@@ -212,8 +213,11 @@ jobs:
       matrix:
         configuration:
           - Debug
+          - Debug JIT
           - Profile
+          - Profile JIT
           - Release
+          - Release JIT
           - Release IDB
           - Release LSM
           - Release LSS
@@ -233,12 +237,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
       - name: Provision SDL3 and Npcap SDK
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -250,13 +258,30 @@ jobs:
 
           if (-not $isNoScreen) {
             # Fetch latest SDL3 VC development package and place it under C:\dev\SDL3
-          $sdlRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/libsdl-org/SDL/releases/latest" -Headers @{"User-Agent"="github-actions"}
-          $sdlAsset = $sdlRelease.assets | Where-Object { $_.name -match '^SDL3-devel-.*-VC\.zip$' } | Select-Object -First 1
-          if (-not $sdlAsset) { throw "Could not find SDL3 VC development zip in latest SDL release assets." }
+          # Prefer release assets; gracefully handle API throttling/error payloads.
+          $sdlZipUrl = ""
+          try {
+            $apiHeaders = @{ "User-Agent" = "github-actions"; "Authorization" = "Bearer $env:GH_TOKEN" }
+            $sdlReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/libsdl-org/SDL/releases?per_page=10" -Headers $apiHeaders
+            $sdlAsset = $sdlReleases | ForEach-Object { $_.assets } | Where-Object { $_.name -match '^SDL3-devel-[0-9.]+-VC\.zip$' } | Select-Object -First 1
+            if ($sdlAsset) { $sdlZipUrl = $sdlAsset.browser_download_url }
+          } catch {
+            Write-Warning "GitHub API release query failed: $($_.Exception.Message)"
+          }
+
+          if (-not $sdlZipUrl) {
+            # Fall back to the releases/latest redirect, which is not subject to API rate limits.
+            Write-Host "Falling back to releases/latest redirect parsing for SDL3 VC zip URL"
+            $latestUrl = (& curl.exe -fsSLI -o NUL -w '%{url_effective}' "https://github.com/libsdl-org/SDL/releases/latest")
+            if ($LASTEXITCODE -ne 0 -or -not $latestUrl) { throw "Could not resolve latest SDL release tag via redirect." }
+            $latestTag = ([string]$latestUrl).TrimEnd('/').Split('/')[-1]
+            $latestVer = $latestTag -replace '^release-', ''
+            $sdlZipUrl = "https://github.com/libsdl-org/SDL/releases/download/$latestTag/SDL3-devel-$latestVer-VC.zip"
+          }
 
           $sdlZip = Join-Path $env:RUNNER_TEMP "sdl3-devel.zip"
           $sdlExtract = Join-Path $env:RUNNER_TEMP "sdl3-devel"
-          Invoke-WebRequest -Uri $sdlAsset.browser_download_url -OutFile $sdlZip
+          Invoke-WebRequest -Uri $sdlZipUrl -OutFile $sdlZip
           Expand-Archive -Path $sdlZip -DestinationPath $sdlExtract -Force
 
           $sdlRoot = Get-ChildItem -Path $sdlExtract -Directory | Select-Object -First 1
@@ -349,12 +374,12 @@ jobs:
           $configuration = "${{ matrix.configuration }}"
           $isNoNetwork = $configuration -match '(^| )NN( |$)'
           $isNoScreen = $configuration -match '(^| )NS( |$)'
-
+          
           if ($isNoNetwork -or $isNoScreen) {
             Write-Host "Building es40.vcxproj only for constrained configuration: $configuration"
-            msbuild "src/Visual Studio/es40.vcxproj" /m /p:Configuration="$configuration" /p:Platform="x64" /p:PlatformToolset="v143" /p:WindowsTargetPlatformVersion="10.0"
+            msbuild "src/Visual Studio/es40.vcxproj" /m /p:Configuration="$configuration" /p:Platform="x64" /p:WindowsTargetPlatformVersion="10.0"
           } else {
-            msbuild "src/Visual Studio/es40.sln" /m /p:Configuration="$configuration" /p:Platform="x64" /p:PlatformToolset="v143" /p:WindowsTargetPlatformVersion="10.0"
+            msbuild "src/Visual Studio/es40.sln" /m /p:Configuration="$configuration" /p:Platform="x64" /p:WindowsTargetPlatformVersion="10.0"
           }
 
       - name: Include SDL3 runtime with built binaries
@@ -462,11 +487,13 @@ jobs:
 
       - name: Build and install latest SDL3
         if: ${{ !contains(matrix.configuration, 'NS') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           # Prefer release assets; gracefully handle API throttling/error payloads.
-          SDL_RELEASES_JSON="$(curl -fsSL -H 'User-Agent: github-actions' https://api.github.com/repos/libsdl-org/SDL/releases?per_page=10 || echo '[]')"
+          SDL_RELEASES_JSON="$(curl -fsSL -H 'User-Agent: github-actions' -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/libsdl-org/SDL/releases?per_page=10 || echo '[]')"
           SDL3_URL="$(printf '%s' "$SDL_RELEASES_JSON" | python -c 'import sys,json,re; data=json.load(sys.stdin); data=[data] if isinstance(data,dict) else data; print(next((a.get("browser_download_url","") for rel in data for a in rel.get("assets",[]) if re.match(r"^SDL3-[0-9.]+\\.tar\\.gz$", a.get("name",""))), ""))')"
 
           if [ -z "$SDL3_URL" ]; then
