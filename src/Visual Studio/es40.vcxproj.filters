@@ -478,6 +478,9 @@
     <None Include="..\es40.cfg">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="..\..\.github\workflows\release.yml">
+      <Filter>Resource Files\.github stuff</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Text Include="..\..\old_vga_docs.txt">

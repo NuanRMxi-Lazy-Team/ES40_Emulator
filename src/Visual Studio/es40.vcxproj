@@ -1838,6 +1838,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\.github\workflows\build.yml" />
+    <None Include="..\..\.github\workflows\release.yml" />
     <None Include="..\..\autogen.sh" />
     <None Include="..\..\ChangeLog" />
     <None Include="..\..\configure.ac" />
