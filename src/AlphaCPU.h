@@ -488,6 +488,10 @@ private:
     }
   }
 
+  // ASN switch: bump the chain epoch so compiled chain edges revalidate through the asn-keyed
+  // lookup paths (the chain guard checks tag+epoch only). No-op in non-JIT builds.
+  void jit_note_asn_change();
+
 #ifdef ES40_JIT
   // JIT block-discovery engine (per-CPU), allocated in init().
   CJitEngine* m_jit = nullptr;

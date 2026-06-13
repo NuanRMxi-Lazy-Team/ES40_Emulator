@@ -712,6 +712,16 @@ static double max_mips = 0.0;
 #include <time.h>
 #endif
 
+// ASN switch: bump the chain epoch so compiled chain edges revalidate through the asn-keyed
+// lookup paths (the chain guard checks tag+epoch only). No-op in non-JIT builds.
+void CAlphaCPU::jit_note_asn_change()
+{
+#ifdef ES40_JIT
+	if (m_jit)
+		m_jit->note_itb_invalidate();
+#endif
+}
+
 #ifdef ES40_JIT
 void CAlphaCPU::jit_flush_blocks()
 {
@@ -764,25 +774,37 @@ void CAlphaCPU::jit_run(int budget)
 		const u64 start_virt = state.pc;
 		const u32 start_asn  = (u32) state.asn;
 
-		// Peek the I-stream up front: gives the physical address (for staleness
-		// validation and recording), the ASM bit, and the I-fetch fault check.
-		// Virtual+ASN keying can't see a page remap, so a block's recorded physical
-		// must still match the live translation before we trust its compiled code --
-		// otherwise we'd run stale bytes. (The interpreter self-heals via icache
-		// refill; the JIT has no such recheck.) A changed phys re-records/recompiles.
-		u32 _ins;
-		state.current_pc = state.pc;   // get_icache TB-miss handler reads current_pc
-		if (get_icache(state.pc, &_ins))
+		// Resolve the block's physical start side-effect-free (FAKE = no fault, no TB fill) so
+		// execute() stays the sole I-stream fetcher; covers superpage/KSEG (no TB entry). phys
+		// validates a compiled block vs the live translation -- virtual+ASN keying misses remaps.
+		u64  start_phys = 0;
+		bool start_asm  = false;
+		bool have_phys  = true;
+		if (start_virt & 1)            // PALmode: physically addressed, always ASM
 		{
-			--budget;
-			continue;
+			start_phys = start_virt & ~U64(1);
+			start_asm  = true;
 		}
-		const u64  start_phys = state.pc_phys;
-		const bool start_asm  = state.icache[state.last_found_icache].asm_bit;
+		else
+		{
+			// Fast path: icache hit-probe reads phys straight from the line, read-only (no fill,
+			// no fault) -- get_icache's hit geometry minus the side effects. Covers warm code.
+			const int ici = (int) (((start_virt & ~U64(3)) >> 11) & (ICACHE_ENTRIES - 1));
+			if (icache_enabled && state.icache[ici].valid
+			    && (state.icache[ici].asn == state.asn || state.icache[ici].asm_bit)
+			    && state.icache[ici].address == (start_virt & ICACHE_MATCH_MASK))
+			{
+				start_phys = state.icache[ici].p_address + (start_virt & ICACHE_BYTE_MASK);
+				start_asm  = state.icache[ici].asm_bit;
+			}
+			// Slow path: superpage/KSEG + cold pages (FAKE = no side effect; miss -> interpret).
+			else if (virt2phys(start_virt, &start_phys, ACCESS_EXEC | FAKE, &start_asm, 0) != 0)
+				have_phys = false;
+		}
 
-		// Hot path: virtual+ASN lookup, validated against the live physical.
-		CJitEngine::JitBlock* b = m_jit->lookup(start_virt, start_asn);
-		if (!b)   // lazy-flushed survivor? hash-revalidate in place (no interpreted pass)
+		// Hot path: virtual+ASN lookup, phys-validated (skipped on a translation miss).
+		CJitEngine::JitBlock* b = have_phys ? m_jit->lookup(start_virt, start_asn) : nullptr;
+		if (have_phys && !b)   // lazy-flushed survivor? hash-revalidate in place (no interpreted pass)
 			b = m_jit->revalidate_flushed(start_virt, start_asn, start_phys, (const uint8_t*) dram_ptr);
 
 		// A valid block whose phys no longer matches = a page remap the virtual key can't see.
@@ -994,6 +1016,7 @@ void CAlphaCPU::jit_run(int budget)
 				state.pc = interp_pc;   // restore; the block's PC write was only for the check
 				put_iprs(ipr_interp);   // roll back the compiled pass's live IPR writes (verify-only)
 				memcpy(state.f, f_interp, sizeof(f_interp));   // ...and its FP writes
+				break_seq_icache();     // compiled pass + raw pc restore bypassed set_pc
 			}
 			continue;
 #else
@@ -1004,11 +1027,12 @@ void CAlphaCPU::jit_run(int budget)
 			m_jit_budget = budget;   // ceiling for compiled chains (epilogue stops at it)
 			const u32 done = b->code(this, &state.r[0]);
 			state.r[31] = 0;
+			break_seq_icache();   // compiled block wrote pc natively (no set_pc); drop the stale cursor
 			// state.pc is written by the compiled block itself (next PC, or the bail PC).
 			// Account for the compiled ops: instruction count (+ cc_large for the legacy speed
-			// calibration). state.cc (RPCC) is no longer advanced per-instruction. 
+			// calibration). state.cc (RPCC) is no longer advanced per-instruction.
 			// wall-clock * cpu_hz at the jit_run boundary above, so a hot compiled loop can't
-			// run the cycle counter ahead of real time 
+			// run the cycle counter ahead of real time
 			state.instruction_count += done;
 			cc_large += (u64) done * cc_per_instruction;
 			budget -= done;
@@ -1019,7 +1043,7 @@ void CAlphaCPU::jit_run(int budget)
 #endif
 		}
 
-		// Miss path (cold): the up-front I-stream peek already gave start_phys/start_asm.
+		// Miss path (cold): the up-front translation gave start_phys/start_asm (when have_phys).
 		// We're not running a compiled block here, so drop any pending link request, interpret
 		// the block, record it, and compile its prefix.
 		m_link_from = nullptr;
@@ -1037,7 +1061,8 @@ void CAlphaCPU::jit_run(int budget)
 #ifdef JIT_STATS
 		m_jit->note_exec(0, n);
 #endif
-		if (state.pc != expected)
+		// Record only translatable block starts (a translation miss left have_phys false).
+		if (have_phys && state.pc != expected)
 		{
 			CJitEngine::JitBlock* nb = m_jit->record(start_virt, start_phys, start_asn, start_asm, n, (const uint8_t*) dram_ptr);
 			if (!nb->compiled)

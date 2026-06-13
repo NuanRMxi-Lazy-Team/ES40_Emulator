@@ -201,6 +201,7 @@
     {                                                                            \
       state.asn = (int) (state.r[REG_2] >> 39) & 0xff;                           \
       flush_data_page_cache();                                                   \
+      jit_note_asn_change();                                                     \
     }                                                                            \
     if(function & 2)                                                             \
     {                                                                            \

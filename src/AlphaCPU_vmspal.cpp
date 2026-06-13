@@ -279,6 +279,7 @@ void CAlphaCPU::vmspal_call_swpctx()
 	state.asn1 = (int)p6;
 	state.asn = (int)p6;
 	flush_data_page_cache();
+	jit_note_asn_change();
 	state.aster = (int)p4 & 0xf;
 	state.astrr = (int)(p4 >> 4) & 0xf;
 	state.fpen = (int)p5 & 1;
