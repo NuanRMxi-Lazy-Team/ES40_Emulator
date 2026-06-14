@@ -611,40 +611,81 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       continue;
     }
 
-    // Memory-format stores: MEM[regs[Rb] + disp16] = regs[Ra]. Via jit_write(cpu,va,size,
-    // value): in verify it compares against the interpreter's recorded store (stores touch
-    // memory, not GPRs), in production it writes (side-effect-free cache translation, bail
-    // on miss). On a fault, bail like a load. (Inline write fast path is a follow-up.)
+    // Memory-format stores: MEM[regs[Rb] + disp16] = regs[Ra]. Inline fast path mirrors the load
+    // path against the WRITE cache [1] (a hit already passed the write-permission + FOW check, so
+    // the page is writable); falls to jit_write on misalign / cache miss / MMIO. In verify the
+    // helper is the only path -- it compares the store against the interpreter's recorded one.
     if (op == OP_STL || op == OP_STQ || op == OP_STB || op == OP_STW || op == OP_STQ_U) {
       const int disp = (int) (int16_t) (ins & 0xFFFF);
       const int size_bits = (op == OP_STQ || op == OP_STQ_U) ? 64 : (op == OP_STL) ? 32 : (op == OP_STW) ? 16 : 8;
-#if defined(_WIN32)
-      if (rb == 31)  a.mov(x86::rdx, imm(disp));                       // va -> RDX
+      const int amask = (size_bits / 8) - 1;
+      if (rb == 31)  a.mov(x86::rdx, imm(disp));                       // va -> RDX (preserved for helper)
       else        {  a.mov(x86::rdx, reg(rb)); if (disp) a.add(x86::rdx, imm(disp)); }
       if (op == OP_STQ_U) a.and_(x86::rdx, imm(~(uint64_t) 7));        // STQ_U: force 8-byte alignment
-      if (ra == 31)  a.xor_(x86::r9d, x86::r9d);                       // value -> R9 (R31 == 0)
-      else           a.mov(x86::r9, reg(ra));
-      a.mov(x86::rcx, x86::rbp);                                       // cpu
-      a.mov(x86::r8d, imm(size_bits));                                 // size in bits
+
+      auto emit_helper = [&]() {
+#if defined(_WIN32)
+        if (ra == 31)  a.xor_(x86::r9d, x86::r9d);                     // value -> R9 (R31 == 0)
+        else           a.mov(x86::r9, reg(ra));
+        a.mov(x86::rcx, x86::rbp);                                     // cpu  (va already in RDX)
+        a.mov(x86::r8d, imm(size_bits));                               // size in bits
 #else
-      if (rb == 31)  a.mov(x86::rsi, imm(disp));                       // va -> RSI
-      else        {  a.mov(x86::rsi, reg(rb)); if (disp) a.add(x86::rsi, imm(disp)); }
-      if (op == OP_STQ_U) a.and_(x86::rsi, imm(~(uint64_t) 7));        // STQ_U: force 8-byte alignment
-      if (ra == 31)  a.xor_(x86::ecx, x86::ecx);                       // value -> RCX (R31 == 0)
-      else           a.mov(x86::rcx, reg(ra));
-      a.mov(x86::rdi, x86::rbp);                                       // cpu
-      a.mov(x86::edx, imm(size_bits));                                 // size in bits
+        a.mov(x86::rsi, x86::rdx);                                     // va -> RSI (before RDX takes size)
+        if (ra == 31)  a.xor_(x86::ecx, x86::ecx);                     // value -> RCX (R31 == 0)
+        else           a.mov(x86::rcx, reg(ra));
+        a.mov(x86::rdi, x86::rbp);                                     // cpu
+        a.mov(x86::edx, imm(size_bits));                               // size in bits
 #endif
-      a.mov(x86::rax, imm((uint64_t) write_helper));
-      a.call(x86::rax);                                               // jit_write(cpu, va, size, value)
-      Label ok = a.new_label();
-      a.test(x86::eax, x86::eax);
-      a.jz(ok);
-      set_pc(b->tag + 4 * (uint64_t) i);                              // resume at the faulting store
-      a.mov(x86::eax, imm(i));                                         // this iteration: i instrs done
-      a.add(x86::eax, x86::r14d);                                      // + earlier chained iterations
-      a.jmp(done);
-      a.bind(ok);
+        a.mov(x86::rax, imm((uint64_t) write_helper));
+        a.call(x86::rax);                                             // jit_write(cpu, va, size, value)
+        Label ok = a.new_label();
+        a.test(x86::eax, x86::eax);
+        a.jz(ok);
+        set_pc(b->tag + 4 * (uint64_t) i);                            // resume at the faulting store
+        a.mov(x86::eax, imm(i));                                       // this iteration: i instrs done
+        a.add(x86::eax, x86::r14d);                                    // + earlier chained iterations
+        a.jmp(done);
+        a.bind(ok);
+      };
+
+#ifdef JIT_VERIFY
+      emit_helper();
+#else
+      // Inline fast path: aligned + data_page_cache[1][dpc_index(va)] hit + DRAM. RDX = va
+      // (preserved for the helper); R11 = write-cache slot byte offset; RAX/R10/R9 scratch.
+      Label slow  = a.new_label();
+      Label sdone = a.new_label();
+      a.test(x86::dl, imm(amask));                                      a.jnz(slow);
+      a.mov(x86::r11, x86::rdx);
+      a.shr(x86::r11, imm(13));
+      a.and_(x86::r11, imm(m_off.dpc_mask));                            // r11 = dpc_index(va)
+      a.imul(x86::r11, x86::r11, imm(m_off.dpc_stride));                // r11 = slot byte offset
+      a.add(x86::r11, imm(m_off.dpc_write_row));                        // -> write cache [1]
+      a.mov(x86::r10, x86::rdx);
+      a.and_(x86::r10, imm(-0x2000));                                   // r10 = va & ~0x1FFF
+      a.cmp(x86::byte_ptr(x86::rbp, x86::r11, 0, m_off.dpc_valid), imm(0));         a.je(slow);
+      a.cmp(x86::qword_ptr(x86::rbp, x86::r11, 0, m_off.dpc_virt_page), x86::r10);  a.jne(slow);
+      a.mov(x86::eax, x86::dword_ptr(x86::rbp, m_off.state_cm));
+      a.cmp(x86::dword_ptr(x86::rbp, x86::r11, 0, m_off.dpc_cm), x86::eax);         a.jne(slow);
+      a.mov(x86::eax, x86::dword_ptr(x86::rbp, m_off.state_asn0));
+      a.cmp(x86::dword_ptr(x86::rbp, x86::r11, 0, m_off.dpc_asn), x86::eax);        a.jne(slow);
+      a.mov(x86::rax, x86::qword_ptr(x86::rbp, x86::r11, 0, m_off.dpc_phys_base));
+      a.mov(x86::r10, x86::rdx);
+      a.and_(x86::r10, imm(0x1FFF));
+      a.or_(x86::rax, x86::r10);                                        // rax = phys
+      a.cmp(x86::rax, x86::qword_ptr(x86::rbp, m_off.dram_size));       a.jae(slow);
+      if (ra == 31)  a.xor_(x86::r9d, x86::r9d);                        // value -> R9 (R31 == 0)
+      else           a.mov(x86::r9, reg(ra));
+      a.mov(x86::r10, x86::qword_ptr(x86::rbp, m_off.dram_ptr));
+      if      (op == OP_STQ || op == OP_STQ_U) a.mov(x86::qword_ptr(x86::r10, x86::rax), x86::r9);   // full quad
+      else if (op == OP_STL)                   a.mov(x86::dword_ptr(x86::r10, x86::rax), x86::r9d);
+      else if (op == OP_STW)                   a.mov(x86::word_ptr(x86::r10, x86::rax), x86::r9w);
+      else                                     a.mov(x86::byte_ptr(x86::r10, x86::rax), x86::r9b);   // STB
+      a.jmp(sdone);
+      a.bind(slow);
+      emit_helper();
+      a.bind(sdone);
+#endif
       continue;
     }
 

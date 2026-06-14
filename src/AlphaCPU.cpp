@@ -453,6 +453,7 @@ void CAlphaCPU::init()
 		o.dpc_asn       = (uint32_t) ((char*) &data_page_cache[0][0].asn       - (char*) this);
 		o.dpc_stride    = (uint32_t) sizeof(data_page_cache[0][0]);
 		o.dpc_mask      = (uint32_t) kDpcMask;
+		o.dpc_write_row = (uint32_t) ((char*) &data_page_cache[1][0] - (char*) &data_page_cache[0][0]);
 		o.state_cm      = (uint32_t) ((char*) &state.cm   - (char*) this);
 		o.state_asn0    = (uint32_t) ((char*) &state.asn0 - (char*) this);
 		o.dram_ptr      = (uint32_t) ((char*) &dram_ptr   - (char*) this);
