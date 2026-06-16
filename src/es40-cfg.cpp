@@ -372,7 +372,18 @@ void add_disks(ShrinkingChoiceQuestion* disk_q, ostream* os, bool floppy = false
 /**
  * Main program entry point.
  **/
+#include "MainWindow.h"
+#include <QApplication>
+
 int main(int argc, char* argv[])
+{
+    QApplication app(argc, argv);
+    MainWindow w;
+    w.show();
+    return app.exec();
+}
+
+int old_main(int argc, char* argv[])
 {
 	/* Banner
 	 */
@@ -1213,4 +1224,3 @@ int main(int argc, char* argv[])
 	 */
 	return 0;
 }
-

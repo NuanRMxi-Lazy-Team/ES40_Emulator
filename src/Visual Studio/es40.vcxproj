@@ -88,7 +88,7 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{C8EAA875-0ABD-48B5-B122-9006AE3D9A08}</ProjectGuid>
-    <WindowsTargetPlatformVersion>8.1</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Profile|x64'" Label="Configuration">
@@ -1714,6 +1714,7 @@
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release JIT|x64'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="..\ES1370.cpp" />
+    <ClCompile Include="..\MainWindow.cpp" />
     <ClCompile Include="..\MPU401.cpp" />
     <ClCompile Include="..\Configurator.cpp" />
     <ClCompile Include="..\DEC21143.cpp" />
@@ -1813,6 +1814,7 @@
     <ClInclude Include="..\gui\keymap.h" />
     <ClInclude Include="..\lockstep.h" />
     <ClInclude Include="..\logmacro.h" />
+    <ClInclude Include="..\MainWindow.h" />
     <ClInclude Include="..\mame_shims.h" />
     <ClInclude Include="..\MPU401.h" />
     <ClInclude Include="..\PCIDevice.h" />

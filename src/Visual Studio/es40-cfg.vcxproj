@@ -15,6 +15,7 @@
     <RootNamespace>es40cfg</RootNamespace>
     <Keyword>Win32Proj</Keyword>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <LatestTargetPlatformVersion>true</LatestTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
@@ -53,8 +54,8 @@
     </Midl>
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>c:\dev\npcap-sdk\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;HAVE_PCAP;HAVE_SDL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>F:\QtFiles\6.9.3\msvc2022_64\include;F:\QtFiles\6.9.3\msvc2022_64\include\QtCore;F:\QtFiles\6.9.3\msvc2022_64\include\QtWidgets;F:\QtFiles\6.9.3\msvc2022_64\include\QtGui;c:\dev\npcap-sdk\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_DEBUG;HAVE_PCAP;HAVE_SDL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -63,13 +64,15 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalOptions>/permissive- /Zc:__cplusplus /utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>wpcap.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Qt6Cored.lib;Qt6Widgetsd.lib;Qt6Guid.lib;wpcap.lib;comctl32.lib;uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)$(ProjectName).exe</OutputFile>
-      <AdditionalLibraryDirectories>c:\dev\npcap-sdk\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>F:\QtFiles\6.9.3\msvc2022_64\lib;E:\npcap\source\Lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <DataExecutionPrevention>
       </DataExecutionPrevention>
@@ -81,8 +84,8 @@
       <TargetEnvironment>X64</TargetEnvironment>
     </Midl>
     <ClCompile>
-      <AdditionalIncludeDirectories>c:\dev\npcap-sdk\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;HAVE_PCAP;HAVE_SDL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>F:\QtFiles\6.9.3\msvc2022_64\include;F:\QtFiles\6.9.3\msvc2022_64\include\QtCore;F:\QtFiles\6.9.3\msvc2022_64\include\QtWidgets;F:\QtFiles\6.9.3\msvc2022_64\include\QtGui;c:\dev\npcap-sdk\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;NDEBUG;HAVE_PCAP;HAVE_SDL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PrecompiledHeader>
       </PrecompiledHeader>
@@ -90,13 +93,15 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <BrowseInformation>true</BrowseInformation>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>wpcap.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Qt6Core.lib;Qt6Widgets.lib;Qt6Gui.lib;wpcap.lib;comctl32.lib;uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)$(ProjectName).exe</OutputFile>
-      <AdditionalLibraryDirectories>c:\dev\npcap-sdk\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>F:\QtFiles\6.9.3\msvc2022_64\lib;E:\npcap\source\Lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
@@ -111,14 +116,12 @@
   <ItemGroup>
     <ClCompile Include="..\es40-cfg.cpp" />
     <ClCompile Include="..\base\Exception.cpp" />
+    <ClCompile Include="..\MainWindow.cpp" />
+    <ClCompile Include="..\moc_MainWindow.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\datatypes.h" />
-    <ClInclude Include="..\FreeTextQuestion.h" />
-    <ClInclude Include="..\MultipleChoiceQuestion.h" />
-    <ClInclude Include="..\NumberQuestion.h" />
-    <ClInclude Include="..\Question.h" />
-    <ClInclude Include="..\ShrinkingChoiceQuestion.h" />
+    <ClInclude Include="..\MainWindow.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
